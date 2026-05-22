@@ -2185,6 +2185,7 @@ RUN_MODE = "single"  # @param ["single", "storyboard", "infinite_flow"]
 
 def _run_single():
     """Generate a single clip using Cell 6 settings."""
+    global SEED
     # Determine prompt
     if not BYPASS_EASY_PROMPT and USER_INPUT.strip():
         print("Running EasyPromptEngine...")
@@ -2231,7 +2232,6 @@ def _run_single():
 
     # Auto-increment seed for next run
     if AUTO_INCREMENT_SEED:
-        global SEED
         SEED += 1
 
     return output
