@@ -78,7 +78,7 @@ install_apt_packages()
 
 # ── Final setup ───────────────────────────────────────────────────────────────
 os.chdir("/content/ComfyUI")
-import os, sys
+# os, sys, subprocess already imported at Cell 1 top
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 sys.path.insert(0, "/content/ComfyUI")
 
@@ -1111,6 +1111,10 @@ CAMERA_LORA_MAPPING = {
     "tilt_up_dramatic": "ltx-2-19b-lora-camera-control-jib-up.safetensors",
     "tilt_up_reveal": "ltx-2-19b-lora-camera-control-jib-up.safetensors",
     "low_angle_hero": "ltx-2-19b-lora-camera-control-jib-up.safetensors",
+    # Additional aliases covering remaining SCENE_JSON camera_movement values
+    "handheld_pov":   "ltx-2-19b-lora-camera-control-dolly-in.safetensors",
+    "dolly_reveal":   "ltx-2-19b-lora-camera-control-dolly-in.safetensors",
+    "push_in_slow":   "ltx-2-19b-lora-camera-control-dolly-in.safetensors",
 }
 
 def build_character_prompt_detailed(character_data: dict) -> str:
