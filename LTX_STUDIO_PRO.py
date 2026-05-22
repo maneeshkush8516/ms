@@ -17,6 +17,8 @@
 # @markdown - **ComfyUI-VideoHelperSuite** (VHS_VideoCombine output node)
 # @markdown - **ComfyUI-LTXVideo** (tiled VAE decode + AV helpers)
 
+import os, sys, subprocess
+
 # ── Base Python packages ──────────────────────────────────────────────────────
 subprocess.run(["pip", "install", "torch", "torchvision", "torchaudio"], check=False, capture_output=True)
 
@@ -51,13 +53,13 @@ os.chdir("/content/ComfyUI/custom_nodes/ComfyUI_GGUF")
 subprocess.run(["pip", "install", "-r", "requirements.txt", "-q"], check=False, capture_output=True)
 
 os.chdir("/content/ComfyUI/custom_nodes/ComfyUI-LTXVideo")
-subprocess.run(["pip", "install", "-r", "requirements.txt", "-q", "2>/dev/null", "||", "true"], check=False, capture_output=True)
+subprocess.run(["pip", "install", "-r", "requirements.txt", "-q"], check=False, capture_output=True)
 
 os.chdir("/content/ComfyUI/custom_nodes/LTX2EasyPrompt-LD")
-subprocess.run(["pip", "install", "-r", "requirements.txt", "-q", "2>/dev/null", "||", "true"], check=False, capture_output=True)
+subprocess.run(["pip", "install", "-r", "requirements.txt", "-q"], check=False, capture_output=True)
 
 os.chdir("/content/ComfyUI/custom_nodes/LTX2-Master-Loader")
-subprocess.run(["pip", "install", "-r", "requirements.txt", "-q", "2>/dev/null", "||", "true"], check=False, capture_output=True)
+subprocess.run(["pip", "install", "-r", "requirements.txt", "-q"], check=False, capture_output=True)
 
 # ── System tools ──────────────────────────────────────────────────────────────
 import subprocess
@@ -1093,16 +1095,22 @@ print("✅ Node wrappers ready.")
 # @markdown ## 💥 9. Character Consistency & JSON Story System
 
 CAMERA_LORA_MAPPING = {
-    "dolly_forward":   "ltx-2-19b-lora-camera-control-dolly-forward.safetensors",
-    "dolly_backward":  "ltx-2-19b-lora-camera-control-dolly-backward.safetensors",
-    "dolly_left":      "ltx-2-19b-lora-camera-control-dolly-left.safetensors",
-    "dolly_right":     "ltx-2-19b-lora-camera-control-dolly-right.safetensors",
-    "pan_left":        "ltx-2-19b-lora-camera-control-pan-left.safetensors",
-    "pan_right":       "ltx-2-19b-lora-camera-control-pan-right.safetensors",
-    "tilt_up":         "ltx-2-19b-lora-camera-control-tilt-up.safetensors",
-    "tilt_down":       "ltx-2-19b-lora-camera-control-tilt-down.safetensors",
-    "zoom_in":         "ltx-2-19b-lora-camera-control-zoom-in.safetensors",
-    "zoom_out":        "ltx-2-19b-lora-camera-control-zoom-out.safetensors",
+    "dolly_in":       "ltx-2-19b-lora-camera-control-dolly-in.safetensors",
+    "dolly_out":      "ltx-2-19b-lora-camera-control-dolly-out.safetensors",
+    "dolly_left":     "ltx-2-19b-lora-camera-control-dolly-left.safetensors",
+    "dolly_right":    "ltx-2-19b-lora-camera-control-dolly-right.safetensors",
+    "jib_up":         "ltx-2-19b-lora-camera-control-jib-up.safetensors",
+    "jib_down":       "ltx-2-19b-lora-camera-control-jib-down.safetensors",
+    "static":         "ltx-2-19b-lora-camera-control-static.safetensors",
+    # Aliases for JSON storyboard shot data compatibility
+    "dolly_forward":  "ltx-2-19b-lora-camera-control-dolly-in.safetensors",
+    "dolly_backward": "ltx-2-19b-lora-camera-control-dolly-out.safetensors",
+    "zoom_in_slow":   "ltx-2-19b-lora-camera-control-dolly-in.safetensors",
+    "zoom_in_fast":   "ltx-2-19b-lora-camera-control-dolly-in.safetensors",
+    "tilt_up_slight": "ltx-2-19b-lora-camera-control-jib-up.safetensors",
+    "tilt_up_dramatic": "ltx-2-19b-lora-camera-control-jib-up.safetensors",
+    "tilt_up_reveal": "ltx-2-19b-lora-camera-control-jib-up.safetensors",
+    "low_angle_hero": "ltx-2-19b-lora-camera-control-jib-up.safetensors",
 }
 
 def build_character_prompt_detailed(character_data: dict) -> str:
@@ -1397,6 +1405,8 @@ PASS2_SIGMAS  = "0.909375, 0.725, 0.421875, 0.0"
 PASS2_SAMPLER = "gradient_estimation"  # @param {type:"string"}
 PASS2_CFG     = 1.0               # @param {type:"number"}
 PASS2_SEED    = 0                  # @param {type:"integer"}
+# PASS2_SEED=0 is intentional: deterministic Pass 2 noise keeps refinement consistent
+# across seeds. Set to SEED+1 if you want varied refinement texture per run.
 
 # ── Tiled VAE ─────────────────────────────────────────────────────────────────
 USE_TILED_VAE          = True   # @param {type:"boolean"}
@@ -2303,10 +2313,10 @@ class InfiniteFlowEngine:
                 )
             except torch.cuda.OutOfMemoryError:
                 _vram_free()
-                print(f"   [IFE] OOM on beat {beat_idx}. Retrying in T2V mode...")
+                print(f"   [IFE] OOM on beat {beat_idx}. Retrying T2V with more tiles...")
                 clip_path = generate_pro(
                     user_input           = beat,
-                    image_path           = None,
+                    image_path           = None,  # T2V mode — drop anchor to save VRAM
                     positive_prompt      = prompt,
                     negative_prompt      = neg,
                     width                = self.width,
@@ -2314,7 +2324,9 @@ class InfiniteFlowEngine:
                     frames               = self.frames,
                     fps                  = self.fps,
                     seed                 = beat_seed + 1,
-                    use_tiled_vae        = False,
+                    use_tiled_vae        = True,   # Keep tiled VAE for memory efficiency
+                    tiled_spatial_tiles  = 4,       # More tiles = less VRAM per tile
+                    tiled_spatial_overlap= 4,
                     output_prefix        = f"IFE_{beat_idx:03d}_retry",
                     bypass_easy_prompt   = True,
                 )
@@ -2524,6 +2536,16 @@ def run_json_storyboard(scene_json: Optional[dict] = None,
 
             try:
                 print(f"\n\U0001f4cd Shot {i+1}/{len(storyboard)} (Attempt {attempt})")
+                # Build per-shot LoRA stack including camera LoRA if specified
+                _cam_lora_file = scene.get("camera_lora")
+                if _cam_lora_file and _cam_lora_file not in (None, "None", ""):
+                    _shot_lora_stack = [
+                        {"on": True,  "lora": _cam_lora_file, "guard": True, "strength": CAMERA_LORA_STRENGTH},
+                    ] + [{"on": False, "lora": "None", "guard": False, "strength": 1.0}] * 9
+                    _shot_lora_json = json.dumps(_shot_lora_stack)
+                else:
+                    _shot_lora_stack = LORA_STACK
+                    _shot_lora_json  = LORA_STACK_JSON
                 clip_path = generate_pro(
                     user_input           = scene["prompt"],
                     image_path           = current_input_img,
@@ -2535,6 +2557,8 @@ def run_json_storyboard(scene_json: Optional[dict] = None,
                     width                = WIDTH,
                     height               = HEIGHT,
                     fps                  = FPS,
+                    lora_stack           = _shot_lora_stack,
+                    lora_stack_json      = _shot_lora_json,
                     output_prefix        = f"{project}_shot_{i+1:02d}",
                     bypass_easy_prompt   = True,
                 )
