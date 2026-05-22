@@ -1,0 +1,60 @@
+{
+  "id": "FEAT-001",
+  "type": "feat",
+  "description": "Write the complete unified LTX_STUDIO_PRO.py file merging all source files into a single 15-cell Google Colab notebook Python file. Every cell must be present, no code duplicated, all utility functions defined once, VRAM discipline maintained throughout.",
+  "status": "completed",
+  "steps": [
+    "Read all source files in full: LTX_PRO.py (2130 lines), LTX2_InfiniteFlow_12Scene.py (1342 lines), LTX2_Infinite_Flow_PRO_v2.py (1299 lines) to understand every function and pattern.",
+
+    "CELL 1 — Environment Setup: Combine install commands from all three scripts. Single set of pip installs (no duplicates): torch, torchsde, einops, diffusers, accelerate, nest_asyncio, av, spandrel, albumentations, onnx, opencv-python, onnxruntime, imageio, imageio-ffmpeg, transformers>=4.43.0, qwen-vl-utils, huggingface_hub, moviepy. Git clones: ComfyUI (pinned branch ComfyUI_22_01_2026_v0.10.0), ComfyUI_KJNodes (kj_1.2.6), ComfyUI_GGUF (ComfyUI_GGUF_22_01_2026), ComfyUI-LTXVideo, LTX2EasyPrompt-LD, LTX2-Master-Loader, ComfyUI-VideoHelperSuite. apt-get aria2 ffmpeg. Set PYTORCH_CUDA_ALLOC_CONF. Use '# @title' and '# @markdown' headers.",
+
+    "CELL 2 — Model Downloads: Single unified _dl() / model_download() aria2c helper with skip-if-cached. Download: UNet GGUF Q4_K_M, Gemma fp4 (fp8 commented out), embeddings connector, video VAE, audio VAE, TaeEncoder VAE, spatial upscaler. ALL 11 LoRAs: Detailer, Canny, Depth, Pose, Dolly-In, Dolly-Out, Dolly-Left, Dolly-Right, Jib-Up, Jib-Down, Static.",
+
+    "CELL 3 — Core Imports & Utilities: All imports (gc, re, json, time, shutil, warnings, asyncio, numpy, torch, cv2, PIL, pathlib, typing, base64, IPython, google.colab). All VRAM helpers: cleanup_memory(), _print_vram() (from LTX_PRO.py — verbose, bar version). Tensor helpers: pil_to_tensor(), tensor_to_pil(), load_image_tensor(), get_last_frame_tensor(). Video helpers: display_video(), save_video_from_components(), concatenate_clips(). ComfyUI loaders: import_custom_nodes() with nest_asyncio safe pattern. get_value_at_index(). validate_model_files(). save_metadata_sidecar(). upload_image(). _load_audio_vae(). All defined ONCE.",
+
+    "CELL 4 — Performance Patches & LoRA System: apply_sage_attention() (PathchSageAttentionKJ wrapper with USE_SAGE_ATTENTION guard). apply_chunk_ff() (LTXVChunkFeedForward wrapper with USE_CHUNK_FF guard). purge_vram() (LayerUtility: PurgeVRAM V2 with torch fallback, uses PURGE_VRAM_AFTER_MODELS guard). _build_lora_stack() returning 10-slot list. apply_lora_stack() with LTX2MasterLoaderLD node preferred, LoraLoaderModelOnly loop fallback. _IC_LORA_FILES dict (none/detailer/canny/depth/pose). _CAMERA_LORA_FILES dict (none/dolly-in/dolly-out/dolly-left/dolly-right/jib-up/jib-down/static).",
+
+    "CELL 5 — VisionDescribeEngine class: Standalone Qwen2.5-VL wrapper from LTX2_InfiniteFlow_12Scene.py. MODEL_OPTIONS dict with 3B-fast and 7B-nsfw. PROMPT class constant. __init__(model_key, offline). describe(image) method: load processor+model, generate 100-130 word description, del model, _vram_free(). Supports both PIL and tensor input.",
+
+    "CELL 6 — EasyPromptEngine class: Full cinematic LLM expansion from LTX2_InfiniteFlow_12Scene.py. MODELS dict (8B/3B/14B). SYSTEM_PROMPT. _CLEAN_RE list. _NEG_BASE and _build_neg() negative prompt builder. __init__(model_size, offline, keep_loaded). _load(), _unload(), _stop_ids(), _clean() static. generate(user_input, frame_count, creativity, seed, scene_context, lora_triggers, character_bible) returning (positive, negative).",
+
+    "CELL 7 — CharacterBible class: From LTX2_InfiniteFlow_12Scene.py. __init__(). add(name, **attributes). extract_from_description(name, description). to_prompt_block() -> str. has_characters(). names(). save(path). load(path). __repr__().",
+
+    "CELL 8 — ComfyUI Node Wrappers: _LLM_LABEL_MAP, _VISION_LABEL_MAP, _CREATIVITY_MAP dicts. _creativity_label(c). run_easy_prompt() — tries LTX2PromptArchitect node, falls back to EasyPromptEngine standalone. run_vision_describe() — tries LTX2VisionDescribe node, falls back to VisionDescribeEngine standalone. Both wrappers respect USE_VISION, VISION_MODEL, LLM_MODEL globals with per-call override params.",
+
+    "CELL 9 — Character Consistency & JSON Story System: From LTX2_Infinite_Flow_PRO_v2.py. build_character_prompt_detailed(character_data). get_character_consistency_prefix(scene_json). get_motion_guidance_prompt(shot). get_camera_lora_for_shot(shot). get_dialogue_for_shot_enhanced(start_time, end_time, dialogue_list). build_audio_atmosphere_prompt(shot, scene_json, start_s, end_s). build_shot_prompt_pro(shot, json_data, shot_index, prev_shot_success). calculate_adaptive_strength(shot, prev_shot, prev_shot_success). build_negative_prompt_enhanced(). CAMERA_LORA_MAPPING dict. extract_overlap_anchor_enhanced(). stitch_videos_with_overlap_pro().",
+
+    "CELL 10 — Configuration: All # @param annotated variables from all three scripts unified. LLM_MODEL, CREATIVITY, BYPASS_EASY_PROMPT, INVENT_DIALOGUE, LORA_TRIGGERS. USE_VISION, VISION_MODEL. SHOW_PREVIEWS, DOWNLOAD_AFTER_GENERATE. WIDTH=768, HEIGHT=512, FRAMES=121, FPS=25, SEED=47, AUTO_INCREMENT_SEED=True. IMAGE_PATH, IMAGE_STRENGTH=1.0. CHARACTER_IMAGE_PATH, CHARACTER_STRENGTH=1.0, CHARACTER_CONSISTENCY_MODE ('i2v'/'anchor'/'both'/'none'), CHARACTER_NAME, CHARACTER_DESCRIPTION. IC_LORA dropdown, IC_LORA_STRENGTH. CAMERA_LORA dropdown, CAMERA_LORA_STRENGTH. USE_SAGE_ATTENTION, USE_CHUNK_FF, PURGE_VRAM_AFTER_MODELS. PRO_MODE, PRO_STEPS, PRO_SCHEDULER, PRO_SPLIT_AT. USE_TILED_VAE and 5 tiled VAE params. UNET_MODEL, CLIP_NAME1, CLIP_NAME2, VAE_VIDEO_MODEL, VAE_AUDIO_MODEL, UPSCALER_MODEL. Pass 1/2 sigma/sampler/cfg params. OUTPUT_PREFIX, USE_SCENE_CONTINUITY. Multi-scene: OVERLAP_FRAMES, ANCHOR_STRENGTH_HIGH, ANCHOR_STRENGTH_LOW, USE_ADAPTIVE_STRENGTH. USE_CHARACTER_LORAS, INJECT_CHARACTER_EVERY_SHOT, USE_MOTION_LORAS. USE_VOICE_SYNC, USE_NEGATIVE_PROMPT_EXPANSION. BASE_PROMPT, NEGATIVE_PROMPT. LORA_STACK = _build_lora_stack(IC_LORA, IC_LORA_STRENGTH, CAMERA_LORA, CAMERA_LORA_STRENGTH). CharacterBible instance 'bible'.",
+
+    "CELL 11 — generate_pro(): Master single-clip function combining best from all scripts. Full ASCII pipeline diagram docstring from LTX_PRO.py (all 9 phases shown in box art). All parameter defaults referencing globals. 9-phase pipeline: Phase 0 (VisionDescribe+EasyPrompt using node wrappers with standalone fallback), Phase 1 (UNet GGUF load + DualCLIPLoader with fp4→fp8 fallback + apply_lora_stack + apply_sage_attention + apply_chunk_ff + purge_vram + VAE load), Phase 2 (CLIPTextEncode pos+neg + ConditioningZeroOut + LTXVConditioning), Phase 3 (character anchor VAEEncode for anchor/both modes), Phase 4 (EmptyImage→×0.5→GetImageSize, EmptyLTXVLatentVideo, optional ResizeImagesByLongerEdge→ImageResizeKJv2→LTXVPreprocess→LTXVImgToVideoInplace, LTXVEmptyLatentAudio, LTXVConcatAVLatent), Phase 5 (ManualSigmas standard OR PRO mode: ModelSamplingSD3+BasicScheduler+SplitSigmas), Phase 6 (CFGGuider+RandomNoise+SamplerCustomAdvanced pass 1), Phase 7 (LTXVSeparateAVLatent+LTXVCropGuides+CFGGuider+LTXVLatentUpsampler+LTXVConcatAVLatent+SamplerCustomAdvanced pass 2), Phase 8 (LTXVSeparateAVLatent, LTXVSpatioTemporalTiledVAEDecode or VAEDecode fallback, LTXVAudioVAEDecode), Phase 9 (VHS_VideoCombine preferred with h264-mp4/crf=19/yuv420p, CreateVideo fallback, save_metadata_sidecar). All ComfyUI nodes annotated with JSON node IDs. VRAM cleanup after CLIP, after upscaler, after UNet, after VAEs.",
+
+    "CELL 12 — InfiniteFlowEngine class: Full class from LTX2_InfiniteFlow_12Scene.py. __init__ with all config params. _rolling_ctx(). _process_beat(beat, current_image, beat_idx, base_seed) with VisionDescribeEngine and EasyPromptEngine calls plus CharacterBible injection. run(story_beats, seed_image_path, base_seed) with last-frame chaining, OOM recovery in T2V mode, show_previews. concat_all(output_name). download_all(). save_bible(path). Uses generate_pro() instead of the old generate_clip() function.",
+
+    "CELL 13 — Multi-Scene JSON Runner: Default SCENE_JSON with the Whispering Cave example (12 shots). build_storyboard_from_json(scene_json) function that iterates shots, calls build_shot_prompt_pro(), get_camera_lora_for_shot(), returns storyboard list. run_json_storyboard(scene_json, base_seed) function: parse storyboard, auto-resume via cache check, 3-retry loop per shot calling generate_pro(), extract_overlap_anchor_enhanced(), stitch_videos_with_overlap_pro() at end. Uses OVERLAP_FRAMES, ANCHOR_STRENGTH_HIGH, ANCHOR_STRENGTH_LOW, USE_ADAPTIVE_STRENGTH, cache_dir.",
+
+    "CELL 14 — run_storyboard() Simple Multi-Scene Runner: From LTX_PRO.py. Accepts list of scene dicts with user_input, image_path, frames, seed, etc. Uses USE_SCENE_CONTINUITY to chain last frames via get_last_frame_tensor() + tensor_to_pil() saved as JPEG. Simple loop calling generate_pro() per scene. Summary printout at end. Example SCENES list with 3 example scenes.",
+
+    "CELL 15 — Interactive Run Cell: MODE variable with options: 'single', 'storyboard', 'json_scene', 'infinite'. For 'single': generate_pro() with all globals, display output. For 'storyboard': run_storyboard(SCENES). For 'json_scene': run_json_storyboard(SCENE_JSON). For 'infinite': InfiniteFlowEngine(bible, ...).run(STORY_BEATS, SEED_IMAGE_PATH). STORY_BEATS list with 12 Elena story beats from LTX2_InfiniteFlow_12Scene.py. SEED_IMAGE_PATH=None. Auto-seed increment when AUTO_INCREMENT_SEED=True. Auto-download when DOWNLOAD_AFTER_GENERATE=True. Full error handling: KeyboardInterrupt, FileNotFoundError, OOM, RuntimeError, generic Exception — matching the comprehensive error handler from LTX_PRO.py Cell 9."
+  ],
+  "acceptance_criteria": [
+    "File /projects/sandbox/ms/LTX_STUDIO_PRO.py exists",
+    "AST parse succeeds: python3 -c 'import ast; ast.parse(open(\"/projects/sandbox/ms/LTX_STUDIO_PRO.py\").read()); print(\"OK\")'",
+    "Line count between 2500 and 3500: wc -l /projects/sandbox/ms/LTX_STUDIO_PRO.py",
+    "Has at least 15 '# @title' cell headers: grep -c '# @title' /projects/sandbox/ms/LTX_STUDIO_PRO.py",
+    "All 15 required functions/classes defined once: grep -c 'def generate_pro\\|class InfiniteFlowEngine\\|class EasyPromptEngine\\|class VisionDescribeEngine\\|class CharacterBible\\|def run_storyboard\\|def run_json_storyboard\\|def build_storyboard_from_json' /projects/sandbox/ms/LTX_STUDIO_PRO.py",
+    "No duplicate function definitions — each major function appears exactly once"
+  ],
+  "verification": [
+    "python3 -c 'import ast; ast.parse(open(\"/projects/sandbox/ms/LTX_STUDIO_PRO.py\").read()); print(\"AST OK\")'",
+    "wc -l /projects/sandbox/ms/LTX_STUDIO_PRO.py",
+    "grep -c '# @title' /projects/sandbox/ms/LTX_STUDIO_PRO.py",
+    "grep -n 'def generate_pro' /projects/sandbox/ms/LTX_STUDIO_PRO.py",
+    "grep -n 'class InfiniteFlowEngine' /projects/sandbox/ms/LTX_STUDIO_PRO.py",
+    "grep -n 'class EasyPromptEngine' /projects/sandbox/ms/LTX_STUDIO_PRO.py",
+    "grep -n 'class VisionDescribeEngine' /projects/sandbox/ms/LTX_STUDIO_PRO.py",
+    "grep -n 'def run_storyboard' /projects/sandbox/ms/LTX_STUDIO_PRO.py",
+    "grep -n 'def run_json_storyboard' /projects/sandbox/ms/LTX_STUDIO_PRO.py"
+  ],
+  "blocked_reason": null,
+  "findings": "2917 lines, 15 cells (all @title markers present), AST OK. Magic commands (!pip, %cd, !git) in Cell 1 converted to subprocess.run() calls for AST compliance. All 8 required functions/classes defined exactly once: generate_pro (line 1448), InfiniteFlowEngine (line 2167), EasyPromptEngine (line 693), VisionDescribeEngine (line 569), CharacterBible (line 905), run_storyboard (line 2593), run_json_storyboard (line 2464), build_storyboard_from_json (line 2446). _vram_free aliased to cleanup_memory for VisionDescribeEngine/EasyPromptEngine compatibility."
+}
