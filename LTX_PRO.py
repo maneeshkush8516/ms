@@ -268,15 +268,59 @@ def import_custom_nodes() -> None:
         asyncio.get_event_loop().run_until_complete(_load())
 
 # ── VRAM helpers ──────────────────────────────────────────────────────────────
-def cleanup_memory(verbose: bool = False) -> None:
-    """Enhanced memory cleanup including ipc_collect for fragmentation."""
+def cleanup_memory(verbose: bool = False, aggressive: bool = False) -> None:
+    """Enhanced memory cleanup. Use aggressive=True between storyboard scenes."""
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
-        torch.cuda.ipc_collect()   # free IPC handles — reduces fragmentation
+        torch.cuda.ipc_collect()
+        if aggressive:
+            # Force Python to release all unreferenced CUDA tensors
+            gc.collect()
+            torch.cuda.empty_cache()
+            gc.collect()
+            torch.cuda.empty_cache()
+            # Reset peak memory stats for monitoring
+            torch.cuda.reset_peak_memory_stats()
+            torch.cuda.reset_accumulated_memory_stats()
     if verbose:
         _print_vram()
+
+
+def nuclear_cleanup() -> None:
+    """
+    Maximum-strength VRAM cleanup between storyboard scenes.
+    Deletes ALL cached node instances and forces full GC cycle.
+    Call this between generate_pro() invocations in storyboard mode.
+    """
+    # Delete all local tensors that might be lingering
+    gc.collect()
+
+    # Force all CUDA tensors to be freed
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+
+    # Multiple GC passes to break reference cycles
+    for _ in range(5):
+        gc.collect()
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+        # Reset memory stats
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.reset_accumulated_memory_stats()
+
+    # Final pass
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    _print_vram()
 
 def _print_vram() -> None:
     if not torch.cuda.is_available():
@@ -407,7 +451,15 @@ def apply_sage_attention(unet):
     try:
         node  = NODE_CLASS_MAPPINGS["PathchSageAttentionKJ"]()
         fn    = getattr(node, node.FUNCTION)
-        unet  = get_value_at_index(fn(model=unet), 0)
+        # Try with sage_attention parameter first (newer KJNodes versions)
+        try:
+            unet = get_value_at_index(fn(model=unet, sage_attention=True), 0)
+        except TypeError:
+            # Older KJNodes versions may not need the parameter
+            try:
+                unet = get_value_at_index(fn(model=unet, sage_attention="enabled"), 0)
+            except TypeError:
+                unet = get_value_at_index(fn(model=unet), 0)
         print("   ✓ SageAttention patch applied (PathchSageAttentionKJ)")
     except Exception as e:
         print(f"   ⚠️  SageAttention failed ({e}) — continuing without it.")
@@ -940,6 +992,72 @@ print(f"   Pro Mode   : {PRO_MODE}  |  steps={PRO_STEPS}, scheduler={PRO_SCHEDUL
 # @markdown ## 💥 7. Define generate_pro()
 # @markdown Run this cell once per session. Edit Cells 5-6 and re-run Cell 9.
 
+# ══════════════════════════════════════════════════════════════════════════════
+# MODEL CACHE — Keeps models loaded between storyboard scenes to avoid
+# repeated load/unload cycles that fragment VRAM on T4 (15GB).
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ModelCache:
+    """
+    Singleton cache for expensive models (UNet, CLIP, VAE).
+    In storyboard mode, models are loaded once and reused.
+    Call .clear() to force full unload.
+    """
+    def __init__(self):
+        self.unet = None
+        self.clip_model = None
+        self.vae_video = None
+        self.vae_audio = None
+        self.upscale_model = None
+        self._unet_name = None
+        self._clip1_name = None
+        self._clip2_name = None
+        self._lora_key = None  # tracks which LoRA config is applied
+
+    def is_loaded(self, unet_name: str, clip1: str, clip2: str) -> bool:
+        """Check if models are already loaded with matching config."""
+        return (self.unet is not None and
+                self._unet_name == unet_name and
+                self._clip1_name == clip1 and
+                self._clip2_name == clip2)
+
+    def store(self, unet, clip_model, vae_video, vae_audio, upscale_model,
+              unet_name: str, clip1: str, clip2: str, lora_key: str):
+        self.unet = unet
+        self.clip_model = clip_model
+        self.vae_video = vae_video
+        self.vae_audio = vae_audio
+        self.upscale_model = upscale_model
+        self._unet_name = unet_name
+        self._clip1_name = clip1
+        self._clip2_name = clip2
+        self._lora_key = lora_key
+
+    def clear(self):
+        """Fully unload all cached models."""
+        attrs = ['unet', 'clip_model', 'vae_video', 'vae_audio', 'upscale_model']
+        for attr in attrs:
+            obj = getattr(self, attr, None)
+            if obj is not None:
+                try:
+                    if hasattr(obj, 'to'):
+                        obj.to('cpu')
+                except:
+                    pass
+                setattr(self, attr, None)
+        self._unet_name = None
+        self._clip1_name = None
+        self._clip2_name = None
+        self._lora_key = None
+        nuclear_cleanup()
+        print("   🗑️  Model cache cleared.")
+
+_MODEL_CACHE = ModelCache()
+
+# Flag to control caching behavior
+ENABLE_MODEL_CACHE = True  # Set False to reload every scene (original behavior)
+
+
 def generate_pro(
     user_input:              str   = USER_INPUT,
     image_path:              str   = IMAGE_PATH,
@@ -1173,102 +1291,126 @@ def generate_pro(
     cleanup_memory(verbose=True)
 
     # ══════════════════════════════════════════════════════════════════════
-    # PHASE 1 — MODEL LOADING
+    # PHASE 1 — MODEL LOADING (with caching for storyboard mode)
     # ══════════════════════════════════════════════════════════════════════
 
     with torch.inference_mode():
 
-        # ── UNet: UnetLoaderGGUF ──────────────────────────────────────────
-        # [197] UnetLoaderGGUF in LD-I2V.json — loads GGUF Q4_K_M distilled
-        print("\n📦 Loading UNet (GGUF Q4_K_M distilled)…")
-        try:
-            unet_loader = NODE_CLASS_MAPPINGS["UnetLoaderGGUF"]()
-            unet        = get_value_at_index(
-                unet_loader.load_unet(unet_name=_unet), 0)
-        except KeyError:
-            raise RuntimeError(
-                "UnetLoaderGGUF not found.\n"
-                "  Fix: Run Cell 1 to clone ComfyUI_GGUF custom node."
-            )
+        # Compute LoRA key for cache invalidation
+        _lora_cache_key = str(sorted([(s["lora"], s["strength"]) for s in _lora_stack if s.get("on")]))
 
-        # ── DualCLIPLoader ────────────────────────────────────────────────
-        # [190] DualCLIPLoader — Gemma text encoder + embeddings connector
-        print("   Loading CLIP encoders (DualCLIPLoader)…")
-        try:
-            clip_loader = NODE_CLASS_MAPPINGS["DualCLIPLoader"]()
-            clip_model  = get_value_at_index(
-                clip_loader.load_clip(
-                    clip_name1=_clip1,
-                    clip_name2=_clip2,
-                    type="ltxv",
-                    device="default"), 0)
-        except Exception as e:
-            print(f"   ⚠️  fp4 CLIP failed ({type(e).__name__}: {e})")
-            print("      Trying fp8 fallback (gemma_3_12B_it_fp8_scaled.safetensors)…")
-            fp8 = "gemma_3_12B_it_fp8_scaled.safetensors"
+        # Check if models are already cached (storyboard mode optimization)
+        if ENABLE_MODEL_CACHE and _MODEL_CACHE.is_loaded(_unet, _clip1, _clip2) and _MODEL_CACHE._lora_key == _lora_cache_key:
+            print("\n📦 Using cached models (storyboard mode)…")
+            unet = _MODEL_CACHE.unet
+            clip_model = _MODEL_CACHE.clip_model
+            vae_video = _MODEL_CACHE.vae_video
+            vae_audio = _MODEL_CACHE.vae_audio
+            upscale_model = _MODEL_CACHE.upscale_model
+            _print_vram()
+        else:
+            # Clear old cache if exists
+            if _MODEL_CACHE.unet is not None:
+                print("   🔄 Model config changed — clearing cache…")
+                _MODEL_CACHE.clear()
+
+            # ── UNet: UnetLoaderGGUF ──────────────────────────────────────────
+            # [197] UnetLoaderGGUF in LD-I2V.json — loads GGUF Q4_K_M distilled
+            print("\n📦 Loading UNet (GGUF Q4_K_M distilled)…")
             try:
-                clip_model = get_value_at_index(
-                    clip_loader.load_clip(
-                        clip_name1=fp8, clip_name2=_clip2,
-                        type="ltxv", device="default"), 0)
-                print("   ✓ fp8 CLIP loaded.")
-            except Exception as e2:
+                unet_loader = NODE_CLASS_MAPPINGS["UnetLoaderGGUF"]()
+                unet        = get_value_at_index(
+                    unet_loader.load_unet(unet_name=_unet), 0)
+            except KeyError:
                 raise RuntimeError(
-                    f"DualCLIPLoader failed: {e2}\n"
-                    "  Fix: Ensure CLIP_NAME1 file is downloaded (Cell 2).\n"
-                    "  fp4 needs Blackwell GPU; use fp8 for T4/A100."
+                    "UnetLoaderGGUF not found.\n"
+                    "  Fix: Run Cell 1 to clone ComfyUI_GGUF custom node."
                 )
 
-        # ── LoRA stack: LTX2MasterLoaderLD [263] ─────────────────────────
-        # [263] LTX2MasterLoaderLD in LD-I2V.json — 10-slot LoRA stacker
-        print("   Applying LoRA stack (LTX2MasterLoaderLD)…")
-        unet, clip_model = apply_lora_stack(unet, clip_model, _lora_stack, _lora_json)
+            # ── DualCLIPLoader ────────────────────────────────────────────────
+            # [190] DualCLIPLoader — Gemma text encoder + embeddings connector
+            print("   Loading CLIP encoders (DualCLIPLoader)…")
+            try:
+                clip_loader = NODE_CLASS_MAPPINGS["DualCLIPLoader"]()
+                clip_model  = get_value_at_index(
+                    clip_loader.load_clip(
+                        clip_name1=_clip1,
+                        clip_name2=_clip2,
+                        type="ltxv",
+                        device="default"), 0)
+            except Exception as e:
+                print(f"   ⚠️  fp4 CLIP failed ({type(e).__name__}: {e})")
+                print("      Trying fp8 fallback (gemma_3_12B_it_fp8_scaled.safetensors)…")
+                fp8 = "gemma_3_12B_it_fp8_scaled.safetensors"
+                try:
+                    clip_model = get_value_at_index(
+                        clip_loader.load_clip(
+                            clip_name1=fp8, clip_name2=_clip2,
+                            type="ltxv", device="default"), 0)
+                    print("   ✓ fp8 CLIP loaded.")
+                except Exception as e2:
+                    raise RuntimeError(
+                        f"DualCLIPLoader failed: {e2}\n"
+                        "  Fix: Ensure CLIP_NAME1 file is downloaded (Cell 2).\n"
+                        "  fp4 needs Blackwell GPU; use fp8 for T4/A100."
+                    )
 
-        # ── Optional performance patches ──────────────────────────────────
-        # [PathchSageAttentionKJ] — KJNodes flash-attention-style patch
-        unet = apply_sage_attention(unet)
-        # [LTXVChunkFeedForward] — ComfyUI-LTXVideo chunk feedforward
-        unet = apply_chunk_ff(unet)
+            # ── LoRA stack: LTX2MasterLoaderLD [263] ─────────────────────────
+            # [263] LTX2MasterLoaderLD in LD-I2V.json — 10-slot LoRA stacker
+            print("   Applying LoRA stack (LTX2MasterLoaderLD)…")
+            unet, clip_model = apply_lora_stack(unet, clip_model, _lora_stack, _lora_json)
 
-        # Purge VRAM after model loading if enabled
-        # [LayerUtility: PurgeVRAM V2] from LayerStyle nodes
-        purge_vram("after unet+lora")
-        _print_vram()
+            # ── Optional performance patches ──────────────────────────────────
+            # [PathchSageAttentionKJ] — KJNodes flash-attention-style patch
+            unet = apply_sage_attention(unet)
+            # [LTXVChunkFeedForward] — ComfyUI-LTXVideo chunk feedforward
+            unet = apply_chunk_ff(unet)
 
-        # ── VAELoader [184] — video VAE ───────────────────────────────────
-        # [184] VAELoader in LD-I2V.json
-        print("   Loading VAEs…")
-        vaeloader  = NODE_CLASS_MAPPINGS["VAELoader"]()
-        vae_video  = get_value_at_index(
-            vaeloader.load_vae(vae_name=VAE_VIDEO_MODEL), 0)
+            # Purge VRAM after model loading if enabled
+            # [LayerUtility: PurgeVRAM V2] from LayerStyle nodes
+            purge_vram("after unet+lora")
+            _print_vram()
 
-        # [196] VAELoaderKJ (or VAELoader fallback) — audio VAE
-        try:
-            vae_audio = get_value_at_index(_load_audio_vae(VAE_AUDIO_MODEL), 0)
-        except Exception as e:
-            raise RuntimeError(
-                f"Audio VAE load failed: {e}\n"
-                "  Fix: Check VAE_AUDIO_MODEL filename in Cell 6."
-            )
+            # ── VAELoader [184] — video VAE ───────────────────────────────────
+            # [184] VAELoader in LD-I2V.json
+            print("   Loading VAEs…")
+            vaeloader  = NODE_CLASS_MAPPINGS["VAELoader"]()
+            vae_video  = get_value_at_index(
+                vaeloader.load_vae(vae_name=VAE_VIDEO_MODEL), 0)
 
-        # ── Spatial upscaler [189] ────────────────────────────────────────
-        # [189] LatentUpscaleModelLoader in LD-I2V.json
-        try:
-            uml = NODE_CLASS_MAPPINGS["LatentUpscaleModelLoader"]()
-            # Try EXECUTE_NORMALIZED first; fall back to load_model if absent
-            if hasattr(uml, "EXECUTE_NORMALIZED"):
-                upscale_model = get_value_at_index(
-                    uml.EXECUTE_NORMALIZED(model_name=UPSCALER_MODEL), 0)
-            elif hasattr(uml, "load_model"):
-                upscale_model = get_value_at_index(
-                    uml.load_model(model_name=UPSCALER_MODEL), 0)
-            else:
-                raise AttributeError("LatentUpscaleModelLoader: no load method found")
-        except Exception as e:
-            raise RuntimeError(
-                f"LatentUpscaleModelLoader failed: {e}\n"
-                "  Fix: Download UPSCALER_MODEL in Cell 2."
-            )
+            # [196] VAELoaderKJ (or VAELoader fallback) — audio VAE
+            try:
+                vae_audio = get_value_at_index(_load_audio_vae(VAE_AUDIO_MODEL), 0)
+            except Exception as e:
+                raise RuntimeError(
+                    f"Audio VAE load failed: {e}\n"
+                    "  Fix: Check VAE_AUDIO_MODEL filename in Cell 6."
+                )
+
+            # ── Spatial upscaler [189] ────────────────────────────────────────
+            # [189] LatentUpscaleModelLoader in LD-I2V.json
+            try:
+                uml = NODE_CLASS_MAPPINGS["LatentUpscaleModelLoader"]()
+                # Try EXECUTE_NORMALIZED first; fall back to load_model if absent
+                if hasattr(uml, "EXECUTE_NORMALIZED"):
+                    upscale_model = get_value_at_index(
+                        uml.EXECUTE_NORMALIZED(model_name=UPSCALER_MODEL), 0)
+                elif hasattr(uml, "load_model"):
+                    upscale_model = get_value_at_index(
+                        uml.load_model(model_name=UPSCALER_MODEL), 0)
+                else:
+                    raise AttributeError("LatentUpscaleModelLoader: no load method found")
+            except Exception as e:
+                raise RuntimeError(
+                    f"LatentUpscaleModelLoader failed: {e}\n"
+                    "  Fix: Download UPSCALER_MODEL in Cell 2."
+                )
+
+            # Store in cache for subsequent scenes
+            if ENABLE_MODEL_CACHE:
+                _MODEL_CACHE.store(unet, clip_model, vae_video, vae_audio, upscale_model,
+                                   _unet, _clip1, _clip2, _lora_cache_key)
+                print("   💾 Models cached for subsequent scenes.")
 
         # ══════════════════════════════════════════════════════════════════
         # PHASE 2 — TEXT ENCODING
@@ -1304,7 +1446,8 @@ def generate_pro(
                 "  Fix: Check DualCLIPLoader output — CLIP may have failed to load."
             )
 
-        del clip_model
+        if not ENABLE_MODEL_CACHE:
+            del clip_model
         cleanup_memory()
 
         # ══════════════════════════════════════════════════════════════════
@@ -1723,7 +1866,8 @@ def generate_pro(
             print(f"   ⚠️  Audio decode failed ({e}) — proceeding without audio.")
             audio_out = None
 
-        del vae_audio
+        if not ENABLE_MODEL_CACHE:
+            del vae_audio
         cleanup_memory()
 
         # ══════════════════════════════════════════════════════════════════
@@ -1802,6 +1946,20 @@ def generate_pro(
                     "  Fix: Check /content/ComfyUI/output/ permissions.\n"
                     "  Also try: VHS_VideoCombine node may need ComfyUI-VideoHelperSuite."
                 )
+
+        # ── Post-generation cleanup for storyboard stability ──────────────
+        # Free decoded frames and audio - they can be huge in RAM
+        try:
+            del decoded_frames
+        except NameError:
+            pass
+        try:
+            if audio_out is not None:
+                del audio_out
+        except NameError:
+            pass
+        # Aggressive GC to free all sampling intermediates
+        cleanup_memory(aggressive=True)
 
     # ── Timing ────────────────────────────────────────────────────────────
     elapsed = time.time() - t0
@@ -1939,8 +2097,17 @@ def run_storyboard(
 
     for i, scene in enumerate(scenes):
         scene_num = i + 1
-        print(f"\n🎬 Scene {scene_num}/{len(scenes)}: {scene.get('output_prefix','Scene')}")
+        print(f"\n{'=' * 70}")
+        print(f"🎬 Scene {scene_num}/{len(scenes)}: {scene.get('output_prefix','Scene')}")
         print(f"   Input: {scene.get('user_input','')[:80]}…")
+
+        # ── Pre-scene VRAM cleanup (critical for T4) ──────────────────────
+        if i > 0:
+            print(f"   🧹 Inter-scene cleanup…")
+            # Aggressive cleanup between scenes to prevent fragmentation
+            cleanup_memory(verbose=True, aggressive=True)
+            # Brief pause to let CUDA memory manager settle
+            time.sleep(2)
 
         # Resolve image_path: use continuity frame if available and not explicitly set
         _image_path = scene.get("image_path")
@@ -1953,6 +2120,7 @@ def run_storyboard(
                 pil_frame = tensor_to_pil(last_tensor)
                 pil_frame.save(_cont_path, "JPEG", quality=95)
                 _image_path = _cont_path
+                del last_tensor  # Free tensor immediately
                 print(f"   ✓ Continuity frame saved: {_cont_path}")
             else:
                 print(f"   ⚠️  Could not extract last frame — skipping continuity.")
@@ -1979,6 +2147,38 @@ def run_storyboard(
             outputs.append(out)
             prev_output = out
             print(f"   ✅ Scene {scene_num} done → {out}")
+        except torch.cuda.OutOfMemoryError:
+            print(f"   ❌ Scene {scene_num} OOM! Attempting recovery…")
+            # Emergency: clear cache and retry once
+            _MODEL_CACHE.clear()
+            nuclear_cleanup()
+            time.sleep(3)
+            try:
+                out = generate_pro(
+                    user_input           = scene.get("user_input", USER_INPUT),
+                    image_path           = _image_path,
+                    positive_prompt      = scene.get("positive_prompt", POSITIVE_PROMPT),
+                    negative_prompt      = scene.get("negative_prompt", NEGATIVE_PROMPT),
+                    width                = scene.get("width", WIDTH),
+                    height               = scene.get("height", HEIGHT),
+                    frames               = scene.get("frames", FRAMES),
+                    fps                  = scene.get("fps", FPS),
+                    seed                 = scene.get("seed", SEED),
+                    image_strength       = scene.get("image_strength", IMAGE_STRENGTH),
+                    character_image_path = scene.get("character_image_path", CHARACTER_IMAGE_PATH),
+                    character_strength   = scene.get("character_strength", CHARACTER_STRENGTH),
+                    character_mode       = scene.get("character_mode", CHARACTER_CONSISTENCY_MODE),
+                    character_name       = scene.get("character_name", CHARACTER_NAME),
+                    character_description= scene.get("character_description", CHARACTER_DESCRIPTION),
+                    output_prefix        = scene.get("output_prefix", OUTPUT_PREFIX),
+                )
+                outputs.append(out)
+                prev_output = out
+                print(f"   ✅ Scene {scene_num} recovered → {out}")
+            except Exception as e2:
+                print(f"   ❌ Scene {scene_num} retry failed: {type(e2).__name__}: {e2}")
+                outputs.append(None)
+                prev_output = None
         except Exception as e:
             import traceback
             print(f"   ❌ Scene {scene_num} failed: {type(e).__name__}: {e}")
@@ -1987,7 +2187,7 @@ def run_storyboard(
             prev_output = None  # don't chain from a failed scene
 
     # ── Summary ───────────────────────────────────────────────────────────
-    print("\n" + "═" * 70)
+    print("\n" + "=" * 70)
     print("🎬 Storyboard Complete")
     print(f"   Total scenes : {len(scenes)}")
     print(f"   Successful   : {sum(1 for p in outputs if p)}")
@@ -1996,7 +2196,7 @@ def run_storyboard(
     for i, p in enumerate(outputs):
         status = "✅" if p else "❌"
         print(f"   {status} Scene {i+1}: {p or 'FAILED'}")
-    print("═" * 70)
+    print("=" * 70)
 
     return outputs
 
