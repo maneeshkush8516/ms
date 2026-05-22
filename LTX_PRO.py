@@ -96,7 +96,7 @@ install_apt_packages()
 # ── Final setup ───────────────────────────────────────────────────────────────
 %cd /content/ComfyUI
 import os, sys
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,garbage_collection_threshold:0.6"
 sys.path.insert(0, "/content/ComfyUI")
 
 clear_output()
@@ -243,7 +243,7 @@ from IPython.display import display, HTML, Image as IPImage, clear_output
 from google.colab import files
 
 warnings.filterwarnings("ignore")
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,garbage_collection_threshold:0.6"
 sys.path.insert(0, "/content/ComfyUI")
 
 # ── ComfyUI core ──────────────────────────────────────────────────────────────
@@ -251,8 +251,13 @@ from nodes import NODE_CLASS_MAPPINGS, LoraLoaderModelOnly
 import folder_paths
 
 # ── Async node loader (Jupyter/Colab safe) ────────────────────────────────────
+_NODES_IMPORTED = False
+
 def import_custom_nodes() -> None:
     """Load all built-in and external custom nodes in a Jupyter/Colab-safe way."""
+    global _NODES_IMPORTED
+    if _NODES_IMPORTED:
+        return
     import nest_asyncio
     from nodes import init_builtin_extra_nodes, init_external_custom_nodes
 
@@ -266,17 +271,58 @@ def import_custom_nodes() -> None:
     except RuntimeError:
         nest_asyncio.apply()
         asyncio.get_event_loop().run_until_complete(_load())
+    _NODES_IMPORTED = True
 
 # ── VRAM helpers ──────────────────────────────────────────────────────────────
+def _unload_comfyui_models():
+    """Attempt to unload all cached models from ComfyUI's model management system."""
+    try:
+        import comfy.model_management
+        comfy.model_management.unload_all_models()
+        comfy.model_management.soft_empty_cache()
+    except Exception:
+        pass
+
 def cleanup_memory(verbose: bool = False) -> None:
-    """Enhanced memory cleanup including ipc_collect for fragmentation."""
-    gc.collect()
+    """Enhanced memory cleanup with triple gc.collect for cyclic references."""
+    if verbose and torch.cuda.is_available():
+        _before = torch.cuda.memory_allocated()
+    for _ in range(3):
+        gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
-        torch.cuda.ipc_collect()   # free IPC handles — reduces fragmentation
+        torch.cuda.ipc_collect()
+        torch.cuda.reset_peak_memory_stats()
     if verbose:
+        if torch.cuda.is_available():
+            _after = torch.cuda.memory_allocated()
+            _freed = (_before - _after) / 1024**2
+            print(f"   🧹 Freed {_freed:.0f} MB VRAM")
         _print_vram()
+
+def deep_cleanup() -> None:
+    """Aggressive memory cleanup for between-scene use in storyboard mode."""
+    print("   🧹 Deep cleanup starting…")
+    _print_vram()
+    _unload_comfyui_models()
+    for _ in range(3):
+        gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        torch.cuda.ipc_collect()
+        torch.cuda.reset_peak_memory_stats()
+    time.sleep(2)
+    print("   🧹 Deep cleanup complete.")
+    _print_vram()
+
+def get_gpu_memory_gb():
+    if torch.cuda.is_available():
+        return torch.cuda.get_device_properties(0).total_memory / 1024**3
+    return 0
+
+IS_T4_GPU = get_gpu_memory_gb() < 17
 
 def _print_vram() -> None:
     if not torch.cuda.is_available():
@@ -1073,7 +1119,8 @@ def generate_pro(
     Returns: output video path (str) or None on failure.
     """
     t0 = time.time()
-    import_custom_nodes()
+    if not _NODES_IMPORTED:
+        import_custom_nodes()
     clear_output()
 
     _lora_stack = lora_stack if lora_stack is not None else LORA_STACK
@@ -1305,7 +1352,7 @@ def generate_pro(
             )
 
         del clip_model
-        cleanup_memory()
+        cleanup_memory(verbose=True)
 
         # ══════════════════════════════════════════════════════════════════
         # PHASE 3 — CHARACTER ANCHOR (mode "anchor" or "both")
@@ -1599,8 +1646,8 @@ def generate_pro(
                 "  Three consecutive deformations → change USER_INPUT/POSITIVE_PROMPT."
             )
 
-        del guider_p1
-        cleanup_memory()
+        del guider_p1, noise_p1, combined_latent
+        cleanup_memory(verbose=True)
         print("   ✓ Pass 1 complete")
 
         # ══════════════════════════════════════════════════════════════════
@@ -1661,8 +1708,8 @@ def generate_pro(
                 "  Fix: Try reducing TILED_SPATIAL_TILES or USE_TILED_VAE=False."
             )
 
-        del guider_p2, unet
-        cleanup_memory()
+        del guider_p2, unet, noise_p2
+        cleanup_memory(verbose=True)
         print("   ✓ Pass 2 complete")
 
         # ══════════════════════════════════════════════════════════════════
@@ -1709,8 +1756,8 @@ def generate_pro(
                 vaedecode.decode(samples=vid_lat_fin, vae=vae_video), 0)
             print("   ✓ Standard VAE decode (VAEDecode)")
 
-        del vae_video
-        cleanup_memory()
+        del vid_lat_fin, aud_lat_fin, vae_video
+        cleanup_memory(verbose=True)
 
         # ── Audio decode [201] ─────────────────────────────────────────────
         # [201] LTXVAudioVAEDecode — decode audio latent
@@ -1724,7 +1771,7 @@ def generate_pro(
             audio_out = None
 
         del vae_audio
-        cleanup_memory()
+        cleanup_memory(verbose=True)
 
         # ══════════════════════════════════════════════════════════════════
         # PHASE 9 — SAVE  (VHS_VideoCombine preferred, CreateVideo fallback)
@@ -1850,6 +1897,7 @@ def generate_pro(
         except Exception as e:
             print(f"   ⚠️  Download failed ({e}) — file is at {output_path}")
 
+    deep_cleanup()
     return output_path
 
 
@@ -1935,12 +1983,15 @@ def run_storyboard(
     print("🎬 Storyboard Runner — Starting")
     print(f"   Scenes    : {len(scenes)}")
     print(f"   Continuity: {use_continuity}")
+    if IS_T4_GPU:
+        print("   ⚠️  T4 GPU detected — extra memory safeguards active")
     print("─" * 70)
 
     for i, scene in enumerate(scenes):
         scene_num = i + 1
         print(f"\n🎬 Scene {scene_num}/{len(scenes)}: {scene.get('output_prefix','Scene')}")
         print(f"   Input: {scene.get('user_input','')[:80]}…")
+        _print_vram()
 
         # Resolve image_path: use continuity frame if available and not explicitly set
         _image_path = scene.get("image_path")
@@ -1958,33 +2009,61 @@ def run_storyboard(
                 print(f"   ⚠️  Could not extract last frame — skipping continuity.")
 
         try:
-            out = generate_pro(
-                user_input           = scene.get("user_input", USER_INPUT),
-                image_path           = _image_path,
-                positive_prompt      = scene.get("positive_prompt", POSITIVE_PROMPT),
-                negative_prompt      = scene.get("negative_prompt", NEGATIVE_PROMPT),
-                width                = scene.get("width", WIDTH),
-                height               = scene.get("height", HEIGHT),
-                frames               = scene.get("frames", FRAMES),
-                fps                  = scene.get("fps", FPS),
-                seed                 = scene.get("seed", SEED),
-                image_strength       = scene.get("image_strength", IMAGE_STRENGTH),
-                character_image_path = scene.get("character_image_path", CHARACTER_IMAGE_PATH),
-                character_strength   = scene.get("character_strength", CHARACTER_STRENGTH),
-                character_mode       = scene.get("character_mode", CHARACTER_CONSISTENCY_MODE),
-                character_name       = scene.get("character_name", CHARACTER_NAME),
-                character_description= scene.get("character_description", CHARACTER_DESCRIPTION),
-                output_prefix        = scene.get("output_prefix", OUTPUT_PREFIX),
-            )
+            try:
+                out = generate_pro(
+                    user_input           = scene.get("user_input", USER_INPUT),
+                    image_path           = _image_path,
+                    positive_prompt      = scene.get("positive_prompt", POSITIVE_PROMPT),
+                    negative_prompt      = scene.get("negative_prompt", NEGATIVE_PROMPT),
+                    width                = scene.get("width", WIDTH),
+                    height               = scene.get("height", HEIGHT),
+                    frames               = scene.get("frames", FRAMES),
+                    fps                  = scene.get("fps", FPS),
+                    seed                 = scene.get("seed", SEED),
+                    image_strength       = scene.get("image_strength", IMAGE_STRENGTH),
+                    character_image_path = scene.get("character_image_path", CHARACTER_IMAGE_PATH),
+                    character_strength   = scene.get("character_strength", CHARACTER_STRENGTH),
+                    character_mode       = scene.get("character_mode", CHARACTER_CONSISTENCY_MODE),
+                    character_name       = scene.get("character_name", CHARACTER_NAME),
+                    character_description= scene.get("character_description", CHARACTER_DESCRIPTION),
+                    output_prefix        = scene.get("output_prefix", OUTPUT_PREFIX),
+                )
+            except torch.cuda.OutOfMemoryError:
+                print(f"   ⚠️  OOM on scene {scene_num} — attempting recovery…")
+                deep_cleanup()
+                time.sleep(5)
+                out = generate_pro(
+                    user_input           = scene.get("user_input", USER_INPUT),
+                    image_path           = _image_path,
+                    positive_prompt      = scene.get("positive_prompt", POSITIVE_PROMPT),
+                    negative_prompt      = scene.get("negative_prompt", NEGATIVE_PROMPT),
+                    width                = scene.get("width", WIDTH),
+                    height               = scene.get("height", HEIGHT),
+                    frames               = scene.get("frames", FRAMES),
+                    fps                  = scene.get("fps", FPS),
+                    seed                 = scene.get("seed", SEED),
+                    image_strength       = scene.get("image_strength", IMAGE_STRENGTH),
+                    character_image_path = scene.get("character_image_path", CHARACTER_IMAGE_PATH),
+                    character_strength   = scene.get("character_strength", CHARACTER_STRENGTH),
+                    character_mode       = scene.get("character_mode", CHARACTER_CONSISTENCY_MODE),
+                    character_name       = scene.get("character_name", CHARACTER_NAME),
+                    character_description= scene.get("character_description", CHARACTER_DESCRIPTION),
+                    output_prefix        = scene.get("output_prefix", OUTPUT_PREFIX),
+                )
             outputs.append(out)
             prev_output = out
             print(f"   ✅ Scene {scene_num} done → {out}")
+            deep_cleanup()
+            time.sleep(3)
+            if IS_T4_GPU:
+                time.sleep(2)
         except Exception as e:
             import traceback
             print(f"   ❌ Scene {scene_num} failed: {type(e).__name__}: {e}")
             traceback.print_exc()
             outputs.append(None)
             prev_output = None  # don't chain from a failed scene
+            deep_cleanup()
 
     # ── Summary ───────────────────────────────────────────────────────────
     print("\n" + "═" * 70)

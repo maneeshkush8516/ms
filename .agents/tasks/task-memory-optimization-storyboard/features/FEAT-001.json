@@ -1,0 +1,48 @@
+{
+  "id": "FEAT-001",
+  "type": "fix",
+  "description": "Add aggressive memory management functions, modify generate_pro() for per-phase cleanup, modify run_storyboard() for between-scene cleanup, add T4 GPU detection, and update PYTORCH_CUDA_ALLOC_CONF - all in LTX_PRO.py to fix OOM crashes during multi-scene storyboard generation.",
+  "status": "in_progress",
+  "steps": [
+    "Step 1 - Update PYTORCH_CUDA_ALLOC_CONF in CELL 1 (line ~98): Change `os.environ[\"PYTORCH_CUDA_ALLOC_CONF\"] = \"expandable_segments:True\"` to `os.environ[\"PYTORCH_CUDA_ALLOC_CONF\"] = \"expandable_segments:True,garbage_collection_threshold:0.6\"`. Also update the duplicate in CELL 3 (around line 230).",
+    "Step 2 - Add module-level flag for import_custom_nodes() in CELL 3 (after the existing import_custom_nodes function around line 255): Add `_NODES_IMPORTED = False` before the function, and modify import_custom_nodes() to check the flag and set it after first successful run.",
+    "Step 3 - Add _unload_comfyui_models() helper in CELL 3 (after import_custom_nodes): ```python\ndef _unload_comfyui_models():\n    \"\"\"Attempt to unload all cached models from ComfyUI's model management system.\"\"\"\n    try:\n        import comfy.model_management\n        comfy.model_management.unload_all_models()\n        comfy.model_management.soft_empty_cache()\n    except Exception:\n        pass\n```",
+    "Step 4 - Replace the existing cleanup_memory() function in CELL 3 with an enhanced version that: runs gc.collect() 3 times to catch cyclic references, calls torch.cuda.empty_cache(), torch.cuda.synchronize(), torch.cuda.ipc_collect(), torch.cuda.reset_peak_memory_stats(). Accepts optional `objects_to_delete` list parameter (list of local variable names is informational only - actual del happens at caller). Logs freed memory when verbose=True by comparing allocated memory before and after.",
+    "Step 5 - Add deep_cleanup() function in CELL 3 (right after cleanup_memory): A more aggressive function that: prints VRAM before, calls _unload_comfyui_models(), runs gc.collect() 3 times, calls torch.cuda.empty_cache(), torch.cuda.synchronize(), torch.cuda.ipc_collect(), resets CUDA peak memory stats, sleeps 2 seconds, prints VRAM after. This is for between-scene use.",
+    "Step 6 - Add get_gpu_memory_gb() and IS_T4_GPU detection in CELL 3 (after deep_cleanup): ```python\ndef get_gpu_memory_gb():\n    if torch.cuda.is_available():\n        return torch.cuda.get_device_properties(0).total_memory / 1024**3\n    return 0\n\nIS_T4_GPU = get_gpu_memory_gb() < 17\n```",
+    "Step 7 - Modify generate_pro() - replace the `import_custom_nodes()` call at the start (line ~1065 'import_custom_nodes()') with a conditional check using the _NODES_IMPORTED flag.",
+    "Step 8 - Modify generate_pro() PHASE 0: After the run_vision_describe() call and after the run_easy_prompt() call (the section ending with 'cleanup_memory(verbose=True)' around line 1170), the existing cleanup_memory(verbose=True) is already there. Good. No change needed here - it already cleans up after LLM/Vision.",
+    "Step 9 - Modify generate_pro() PHASE 2: After `del clip_model` (around line 1310), change `cleanup_memory()` to `cleanup_memory(verbose=True)` to confirm CLIP memory is freed.",
+    "Step 10 - Modify generate_pro() after PHASE 6 (Pass 1 complete, around line 1615): After `del guider_p1` add `del noise_p1, combined_latent` and change `cleanup_memory()` to `cleanup_memory(verbose=True)`.",
+    "Step 11 - Modify generate_pro() after PHASE 7 (Pass 2 complete, around line 1665): After `del guider_p2, unet` add deletion of other phase 7 intermediates like `del noise_p2` and change `cleanup_memory()` to `cleanup_memory(verbose=True)`.",
+    "Step 12 - Modify generate_pro() PHASE 8: After `del vae_video` (line ~1720), change `cleanup_memory()` to `cleanup_memory(verbose=True)`. After `del vae_audio` (line ~1735), change `cleanup_memory()` to `cleanup_memory(verbose=True)`. Also add `del vid_lat_fin, aud_lat_fin` before the vae_video del.",
+    "Step 13 - Add deep_cleanup() at the very end of generate_pro(), just before `return output_path` (around line 1870): Call `deep_cleanup()` to completely free all GPU memory for the next scene.",
+    "Step 14 - Modify run_storyboard() to add between-scene memory cleanup. In the for loop (around line 1960), add: (a) Print VRAM before each scene with _print_vram(), (b) After each scene completes (after `outputs.append(out)` and `prev_output = out`), call `deep_cleanup()` and `time.sleep(3)`, (c) In the except block, also call `deep_cleanup()`, (d) Add OOM retry logic: wrap the generate_pro() call in a try/except for torch.cuda.OutOfMemoryError, and on OOM call deep_cleanup(), time.sleep(5), then retry once.",
+    "Step 15 - Add T4-specific safety in run_storyboard(): If IS_T4_GPU is True, print a note about T4 optimizations being active, and add an extra time.sleep(2) between scenes after cleanup."
+  ],
+  "acceptance_criteria": [
+    "File parses without syntax errors (ast.parse succeeds)",
+    "cleanup_memory() function runs gc.collect() 3 times and includes torch.cuda.reset_peak_memory_stats()",
+    "deep_cleanup() function exists and calls _unload_comfyui_models(), gc.collect() 3x, torch.cuda.empty_cache(), time.sleep(2)",
+    "_unload_comfyui_models() function exists and tries comfy.model_management.unload_all_models()",
+    "get_gpu_memory_gb() function exists and IS_T4_GPU variable is defined",
+    "PYTORCH_CUDA_ALLOC_CONF includes 'garbage_collection_threshold:0.6'",
+    "import_custom_nodes() uses _NODES_IMPORTED flag to skip redundant loads",
+    "generate_pro() calls deep_cleanup() before returning",
+    "run_storyboard() calls deep_cleanup() between scenes and has OOM retry logic",
+    "All PHASE comments and cell structure comments are preserved",
+    "Function signatures of generate_pro() and run_storyboard() remain backward-compatible"
+  ],
+  "verification": [
+    "Run: python -c \"import ast; ast.parse(open('/projects/sandbox/ms/LTX_PRO.py').read()); print('OK')\"",
+    "Run: grep -c 'def deep_cleanup' /projects/sandbox/ms/LTX_PRO.py  (should output 1)",
+    "Run: grep -c 'def _unload_comfyui_models' /projects/sandbox/ms/LTX_PRO.py  (should output 1)",
+    "Run: grep -c 'def get_gpu_memory_gb' /projects/sandbox/ms/LTX_PRO.py  (should output 1)",
+    "Run: grep -c '_NODES_IMPORTED' /projects/sandbox/ms/LTX_PRO.py  (should output >= 3)",
+    "Run: grep 'garbage_collection_threshold' /projects/sandbox/ms/LTX_PRO.py  (should find the setting)",
+    "Run: grep -c 'deep_cleanup()' /projects/sandbox/ms/LTX_PRO.py  (should be >= 3, one in generate_pro return, and multiple in run_storyboard)",
+    "Run: grep -c 'PHASE' /projects/sandbox/ms/LTX_PRO.py  (count should be same as original - all phase comments preserved)"
+  ],
+  "blocked_reason": null,
+  "findings": ""
+}
