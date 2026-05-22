@@ -96,7 +96,7 @@ install_apt_packages()
 # ── Final setup ───────────────────────────────────────────────────────────────
 %cd /content/ComfyUI
 import os, sys
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:512"
 sys.path.insert(0, "/content/ComfyUI")
 
 clear_output()
@@ -163,13 +163,13 @@ dit_model = model_download(
     "/content/ComfyUI/models/unet")
 
 # ── Text encoders ─────────────────────────────────────────────────────────────
-# Gemma fp4 — RTX 5000 Blackwell. Use fp8 for T4/A100 (uncomment below).
+# Gemma fp8 — T4/A100 safe default. Use fp4 for RTX 5000 Blackwell (uncomment below).
 text_encoder_model = model_download(
-    f"{COMFYORG}/text_encoders/gemma_3_12B_it_fp4_mixed.safetensors",
+    f"{COMFYORG}/text_encoders/gemma_3_12B_it_fp8_scaled.safetensors",
     "/content/ComfyUI/models/text_encoders")
-# Gemma fp8 — T4 / A100 / RTX 3000-4000 (uncomment if fp4 OOMs):
+# Gemma fp4 — RTX 5000 Blackwell only (uncomment if you have Blackwell GPU):
 # text_encoder_model = model_download(
-#     f"{COMFYORG}/text_encoders/gemma_3_12B_it_fp8_scaled.safetensors",
+#     f"{COMFYORG}/text_encoders/gemma_3_12B_it_fp4_mixed.safetensors",
 #     "/content/ComfyUI/models/text_encoders")
 
 # Embeddings connector — distilled version (must match GGUF)
@@ -243,7 +243,7 @@ from IPython.display import display, HTML, Image as IPImage, clear_output
 from google.colab import files
 
 warnings.filterwarnings("ignore")
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:512"
 sys.path.insert(0, "/content/ComfyUI")
 
 # ── ComfyUI core ──────────────────────────────────────────────────────────────
@@ -268,15 +268,109 @@ def import_custom_nodes() -> None:
         asyncio.get_event_loop().run_until_complete(_load())
 
 # ── VRAM helpers ──────────────────────────────────────────────────────────────
-def cleanup_memory(verbose: bool = False) -> None:
-    """Enhanced memory cleanup including ipc_collect for fragmentation."""
+def cleanup_memory(verbose: bool = False, force: bool = False) -> None:
+    """Enhanced memory cleanup with multi-pass GC and optional aggressive mode.
+
+    Args:
+        verbose: Print VRAM usage after cleanup.
+        force: Extra-aggressive cleanup — multiple GC passes, reset memory stats,
+               trim CPU-side malloc arenas, and delete unreferenced CUDA tensors.
+    """
+    import ctypes
+
+    before = None
+    if verbose and torch.cuda.is_available():
+        before = torch.cuda.memory_allocated() / 1024**3
+
+    # Multi-pass garbage collection (catches reference cycles)
     gc.collect()
+    gc.collect()
+    if force:
+        gc.collect()
+
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
-        torch.cuda.ipc_collect()   # free IPC handles — reduces fragmentation
-    if verbose:
+        torch.cuda.ipc_collect()   # free IPC handles -- reduces fragmentation
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.reset_accumulated_memory_stats()
+
+        if force:
+            # Delete any unreferenced CUDA tensors still lingering
+            import sys as _sys
+            for obj in gc.get_objects():
+                try:
+                    if isinstance(obj, torch.Tensor) and obj.is_cuda:
+                        if _sys.getrefcount(obj) <= 2:  # only GC list + getrefcount ref
+                            del obj
+                except (ReferenceError, TypeError):
+                    pass
+            gc.collect()
+            torch.cuda.empty_cache()
+
+    # CPU-side memory release (Linux/Colab)
+    try:
+        libc = ctypes.CDLL("libc.so.6")
+        libc.malloc_trim(0)
+    except (OSError, AttributeError):
+        pass
+
+    if verbose and torch.cuda.is_available():
+        after = torch.cuda.memory_allocated() / 1024**3
+        if before is not None:
+            freed = before - after
+            print(f"   [cleanup] freed {freed:.2f} GB")
         _print_vram()
+
+
+def t4_safe_settings():
+    """Auto-configure safe defaults for T4 GPU (15GB VRAM)."""
+    if not torch.cuda.is_available():
+        return
+    gpu_name = torch.cuda.get_device_properties(0).name
+    total_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
+    if total_gb < 16:  # T4 has ~15.1GB
+        global USE_CHUNK_FF, USE_TILED_VAE, TILED_SPATIAL_TILES
+        global LLM_MODEL, VISION_MODEL, PURGE_VRAM_AFTER_MODELS
+        USE_CHUNK_FF = True
+        USE_TILED_VAE = True
+        TILED_SPATIAL_TILES = 4
+        PURGE_VRAM_AFTER_MODELS = True
+        print(f"   T4 detected ({total_gb:.1f}GB) -- applying safe memory settings:")
+        print(f"      USE_CHUNK_FF=True, USE_TILED_VAE=True, TILED_SPATIAL_TILES=4")
+
+
+def offload_model_to_cpu(model, label="model"):
+    """Move model to CPU to free GPU VRAM. Returns the CPU model."""
+    if model is not None and hasattr(model, 'to'):
+        try:
+            model = model.to('cpu')
+            cleanup_memory()
+            print(f"   [offload] {label} offloaded to CPU")
+        except Exception:
+            pass
+    return model
+
+
+def memory_guard(label="operation", threshold_pct=90):
+    """Check VRAM and warn if approaching limit."""
+    if not torch.cuda.is_available():
+        return True
+    used = torch.cuda.memory_allocated() / 1024**3
+    total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+    pct = used / total * 100
+    if pct > threshold_pct:
+        print(f"   VRAM WARNING before {label}: {used:.1f}/{total:.1f}GB ({pct:.0f}%)")
+        cleanup_memory(force=True)
+        return False
+    return True
+
+
+# Set max VRAM fraction for PyTorch (leave headroom for CUDA kernels)
+if torch.cuda.is_available():
+    total_mem = torch.cuda.get_device_properties(0).total_memory
+    if total_mem < 16 * 1024**3:  # T4
+        torch.cuda.set_per_process_memory_fraction(0.92)
 
 def _print_vram() -> None:
     if not torch.cuda.is_available():
@@ -639,7 +733,7 @@ def run_easy_prompt(user_input: str, frame_count: int, seed: int,
     prompt     = result[0]  # PROMPT output
     neg_prompt = result[2]  # NEG_PROMPT output
     print(f"   [EasyPrompt] ✓  {len(prompt.split())} words generated.")
-    cleanup_memory()
+    cleanup_memory(force=True)
     return prompt, neg_prompt
 
 
@@ -677,13 +771,16 @@ def run_vision_describe(image_tensor: torch.Tensor,
     if character_desc:
         ctx = character_desc + " " + ctx
     print(f"   [VisionDescribe] ✓  {len(ctx.split())} words.")
-    cleanup_memory()
+    cleanup_memory(force=True)
     return ctx
 
 
 print("✅ Imports & helpers ready.")
 print("   Helper functions defined:")
-print("   ✓ cleanup_memory()       — with ipc_collect()")
+print("   ✓ cleanup_memory()       — multi-pass GC + force mode for T4")
+print("   ✓ t4_safe_settings()     — auto-detect T4 and apply safe defaults")
+print("   ✓ offload_model_to_cpu() — move model to CPU to free VRAM")
+print("   ✓ memory_guard()         — VRAM threshold check with auto-cleanup")
 print("   ✓ apply_sage_attention() — PathchSageAttentionKJ wrapper")
 print("   ✓ apply_chunk_ff()       — LTXVChunkFeedForward wrapper")
 print("   ✓ purge_vram()           — LayerUtility: PurgeVRAM V2 wrapper")
@@ -887,8 +984,8 @@ AUTO_INCREMENT_SEED = True  # @param {type:"boolean"}
 
 # ── Model filenames ───────────────────────────────────────────────────────────
 UNET_MODEL      = "ltx-2-19b-distilled_Q4_K_M.gguf"
-# Gemma: choose ONE matching your GPU (fp4 for Blackwell, fp8 for T4/A100)
-CLIP_NAME1      = "gemma_3_12B_it_fp4_mixed.safetensors"
+# Gemma: choose ONE matching your GPU (fp8 for T4/A100, fp4 for Blackwell)
+CLIP_NAME1      = "gemma_3_12B_it_fp8_scaled.safetensors"  # fp8 -- T4/A100 safe default
 CLIP_NAME2      = "ltx-2-19b-embeddings_connector_distill_bf16.safetensors"
 VAE_VIDEO_MODEL = "LTX2_video_vae_bf16.safetensors"
 VAE_AUDIO_MODEL = "LTX2_audio_vae_bf16.safetensors"
@@ -1170,7 +1267,7 @@ def generate_pro(
         print("   [EasyPrompt] Bypassed — using manual POSITIVE_PROMPT.")
 
     # LLM/Vision should now be unloaded — free VRAM before loading video model
-    cleanup_memory(verbose=True)
+    cleanup_memory(verbose=True, force=True)
 
     # ══════════════════════════════════════════════════════════════════════
     # PHASE 1 — MODEL LOADING
@@ -1190,6 +1287,14 @@ def generate_pro(
                 "UnetLoaderGGUF not found.\n"
                 "  Fix: Run Cell 1 to clone ComfyUI_GGUF custom node."
             )
+
+        # VRAM check after UNet load
+        if torch.cuda.is_available():
+            used_gb = torch.cuda.memory_allocated() / 1024**3
+            total_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
+            if used_gb / total_gb > 0.85:
+                print(f"   VRAM usage high ({used_gb:.1f}/{total_gb:.1f}GB) -- forcing cleanup")
+                cleanup_memory(force=True)
 
         # ── DualCLIPLoader ────────────────────────────────────────────────
         # [190] DualCLIPLoader — Gemma text encoder + embeddings connector
@@ -1219,10 +1324,13 @@ def generate_pro(
                     "  fp4 needs Blackwell GPU; use fp8 for T4/A100."
                 )
 
+        cleanup_memory()
+
         # ── LoRA stack: LTX2MasterLoaderLD [263] ─────────────────────────
         # [263] LTX2MasterLoaderLD in LD-I2V.json — 10-slot LoRA stacker
         print("   Applying LoRA stack (LTX2MasterLoaderLD)…")
         unet, clip_model = apply_lora_stack(unet, clip_model, _lora_stack, _lora_json)
+        cleanup_memory()
 
         # ── Optional performance patches ──────────────────────────────────
         # [PathchSageAttentionKJ] — KJNodes flash-attention-style patch
@@ -1253,6 +1361,7 @@ def generate_pro(
 
         # ── Spatial upscaler [189] ────────────────────────────────────────
         # [189] LatentUpscaleModelLoader in LD-I2V.json
+        cleanup_memory()
         try:
             uml = NODE_CLASS_MAPPINGS["LatentUpscaleModelLoader"]()
             # Try EXECUTE_NORMALIZED first; fall back to load_model if absent
@@ -1304,8 +1413,8 @@ def generate_pro(
                 "  Fix: Check DualCLIPLoader output — CLIP may have failed to load."
             )
 
-        del clip_model
-        cleanup_memory()
+        del clip_model, cte
+        cleanup_memory(force=True)
 
         # ══════════════════════════════════════════════════════════════════
         # PHASE 3 — CHARACTER ANCHOR (mode "anchor" or "both")
@@ -1377,6 +1486,8 @@ def generate_pro(
             except Exception as e:
                 print(f"   ⚠️  Character anchor failed ({e}) — continuing without anchor.")
                 anchor_latent = None
+
+        cleanup_memory()
 
         # [108] EmptyLTXVLatentVideo — half-res video latent
         eltxv   = NODE_CLASS_MAPPINGS["EmptyLTXVLatentVideo"]()
@@ -1600,7 +1711,7 @@ def generate_pro(
             )
 
         del guider_p1
-        cleanup_memory()
+        cleanup_memory(force=True)
         print("   ✓ Pass 1 complete")
 
         # ══════════════════════════════════════════════════════════════════
@@ -1638,7 +1749,7 @@ def generate_pro(
             upscale_model=upscale_model,
             vae=vae_video)
         del upscale_model
-        cleanup_memory()
+        cleanup_memory(force=True)
 
         # [LTXVConcatAVLatent] [117] — upsampled video + audio
         av_lat2 = catav.EXECUTE_NORMALIZED(
@@ -1662,7 +1773,7 @@ def generate_pro(
             )
 
         del guider_p2, unet
-        cleanup_memory()
+        cleanup_memory(force=True)
         print("   ✓ Pass 2 complete")
 
         # ══════════════════════════════════════════════════════════════════
@@ -1710,7 +1821,7 @@ def generate_pro(
             print("   ✓ Standard VAE decode (VAEDecode)")
 
         del vae_video
-        cleanup_memory()
+        cleanup_memory(force=True)
 
         # ── Audio decode [201] ─────────────────────────────────────────────
         # [201] LTXVAudioVAEDecode — decode audio latent
@@ -1724,7 +1835,7 @@ def generate_pro(
             audio_out = None
 
         del vae_audio
-        cleanup_memory()
+        cleanup_memory(force=True)
 
         # ══════════════════════════════════════════════════════════════════
         # PHASE 9 — SAVE  (VHS_VideoCombine preferred, CreateVideo fallback)
@@ -1850,6 +1961,7 @@ def generate_pro(
         except Exception as e:
             print(f"   ⚠️  Download failed ({e}) — file is at {output_path}")
 
+    cleanup_memory(force=True)
     return output_path
 
 
