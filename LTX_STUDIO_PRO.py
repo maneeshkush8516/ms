@@ -2619,12 +2619,21 @@ print("\u2705 JSON storyboard runner ready.")
 # @markdown scene N is automatically used as seed for scene N+1.
 
 def run_storyboard(
-    scenes:          List[Dict],
-    use_continuity:  bool = None,
-    tmp_dir:         str  = "/content/ComfyUI/input",
+    scenes:           List[Dict],
+    use_continuity:   bool = None,
+    tmp_dir:          str  = "/content/ComfyUI/input",
+    start_from_scene: int  = 1,
+    checkpoint_file:  str  = "/content/ComfyUI/output/storyboard_checkpoint.json",
 ) -> List[Optional[str]]:
     """
     Run a list of scenes sequentially, optionally chaining last-frame continuity.
+
+    Crash-resume support:
+      start_from_scene -- 1-based; set to 2 to skip Scene 1 after a crash.
+                          If 1 (default), the checkpoint file is checked first
+                          and the resume point is auto-detected from it.
+      checkpoint_file  -- JSON file mapping scene number (str) to output path.
+                          Written after each successful scene.
 
     Each scene dict supports these keys (all optional except user_input):
       user_input           -- story description for Easy Prompt
@@ -2643,16 +2652,51 @@ def run_storyboard(
     if use_continuity is None:
         use_continuity = USE_SCENE_CONTINUITY
     os.makedirs(tmp_dir, exist_ok=True)
+
+    # ── Load checkpoint ───────────────────────────────────────────────────────
+    checkpoint = {}
+    if os.path.exists(checkpoint_file):
+        try:
+            with open(checkpoint_file) as _f:
+                checkpoint = json.load(_f)
+            print(f"   \U0001f4c4 Checkpoint loaded: {checkpoint_file} ({len(checkpoint)} scenes recorded)")
+        except Exception as _e:
+            print(f"   \u26a0\ufe0f  Could not read checkpoint ({_e}) -- starting fresh.")
+
+    # Auto-detect resume point from checkpoint when caller did not override
+    _effective_start = start_from_scene
+    if start_from_scene <= 1 and checkpoint:
+        _completed = [int(k) for k in checkpoint if checkpoint[k]]
+        if _completed:
+            _effective_start = max(_completed) + 1
+            if _effective_start > 1:
+                print(f"   \U0001f501 Auto-resume: checkpoint shows scenes {sorted(_completed)} done -- starting from scene {_effective_start}.")
+
     outputs     = []
     prev_output = None
 
     print("\U0001f3ac Storyboard Runner -- Starting")
     print(f"   Scenes    : {len(scenes)}")
     print(f"   Continuity: {use_continuity}")
+    if _effective_start > 1:
+        print(f"   Resuming from scene {_effective_start} (scenes 1-{_effective_start - 1} skipped)")
     print("-" * 70)
 
     for i, scene in enumerate(scenes):
         scene_num = i + 1
+
+        # ── Skip already-completed scenes, but restore prev_output for continuity
+        if scene_num < _effective_start:
+            ckpt_path = checkpoint.get(str(scene_num))
+            if ckpt_path and os.path.exists(ckpt_path):
+                print(f"\n   \u23e9 Scene {scene_num} skipped (checkpoint: {ckpt_path})")
+                prev_output = ckpt_path
+            else:
+                print(f"\n   \u23e9 Scene {scene_num} skipped (no checkpoint entry -- continuity unavailable)")
+                prev_output = None
+            outputs.append(ckpt_path if ckpt_path and os.path.exists(ckpt_path) else None)
+            continue
+
         print(f"\n\U0001f3ac Scene {scene_num}/{len(scenes)}: {scene.get('output_prefix','Scene')}")
         print(f"   Input: {scene.get('user_input','')[:80]}...")
 
@@ -2691,6 +2735,18 @@ def run_storyboard(
             outputs.append(out)
             prev_output = out
             print(f"   \u2705 Scene {scene_num} done -> {out}")
+
+            # ── Write checkpoint after each successful scene ──────────────────
+            if out:
+                checkpoint[str(scene_num)] = out
+                try:
+                    os.makedirs(os.path.dirname(checkpoint_file), exist_ok=True)
+                    with open(checkpoint_file, "w") as _f:
+                        json.dump(checkpoint, _f, indent=2)
+                    print(f"   \U0001f4c4 Checkpoint saved: {checkpoint_file}")
+                except Exception as _e:
+                    print(f"   \u26a0\ufe0f  Could not write checkpoint: {_e}")
+
         except Exception as e:
             import traceback
             print(f"   \u274c Scene {scene_num} failed: {type(e).__name__}: {e}")
@@ -2710,6 +2766,10 @@ def run_storyboard(
     print("=" * 70)
     return outputs
 
+
+# ── Crash-resume: set START_FROM_SCENE = 2 to skip Scene 1 after a crash ─────
+START_FROM_SCENE   = 1    # @param {type:"integer"}
+CHECKPOINT_FILE    = "/content/ComfyUI/output/storyboard_checkpoint.json"  # @param {type:"string"}
 
 # Example SCENES list -- edit or extend
 SCENES = [
@@ -2846,8 +2906,12 @@ try:
     elif MODE == "storyboard":
         print("\U0001f3ac Running storyboard mode...")
         storyboard_outputs = run_storyboard(
-            scenes=SCENES, use_continuity=USE_SCENE_CONTINUITY)
-        output = storyboard_outputs[-1] if storyboard_outputs else None
+            scenes=SCENES,
+            use_continuity=USE_SCENE_CONTINUITY,
+            start_from_scene=START_FROM_SCENE,
+            checkpoint_file=CHECKPOINT_FILE,
+        )
+        output = next((p for p in reversed(storyboard_outputs) if p), None)
         if AUTO_INCREMENT_SEED:
             SEED = _current_seed + len(SCENES)
             print(f"\U0001f522 Next seed: {SEED}")
@@ -2943,3 +3007,121 @@ except Exception as e:
     print("   Persistent deformation (3x same) -> change USER_INPUT / POSITIVE_PROMPT")
     print("   Character drift                  -> try CHARACTER_CONSISTENCY_MODE='both'")
     print("                                       or increase CHARACTER_STRENGTH")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CELL 16  --  CRASH RESUME: Generate a Single Scene After Session Restart
+# ══════════════════════════════════════════════════════════════════════════════
+
+# @title  { "single-column": true }
+# @markdown ## 💥 16. Crash Resume — Generate One Scene After Session Restart
+# @markdown Run ALL of Cells 1–10 first to restore the environment and config.
+# @markdown Then run this cell to generate a specific scene without re-running
+# @markdown scenes you already completed.
+# @markdown
+# @markdown **How to use after a crash:**
+# @markdown 1. Run Cells 1–10 (environment, models, imports, config)
+# @markdown 2. Set `RESUME_SCENE_INDEX` to the scene you want (2 = Scene 2)
+# @markdown 3. Set `RESUME_PREV_VIDEO` to the output path of the previous scene
+# @markdown    (check `/content/ComfyUI/output/` for the file), or leave None
+# @markdown 4. Run this cell
+
+RESUME_SCENE_INDEX = 2      # @param {type:"integer"}
+# Path to the video output from the PREVIOUS scene (for last-frame continuity).
+# Set to None to run in T2V mode (no continuity seed).
+# e.g. "/content/ComfyUI/output/Story01-Character_00001_.mp4"
+RESUME_PREV_VIDEO  = None   # @param {type:"string"}
+
+# ── Load SCENES definition (runs Cell 14 globals) ────────────────────────────
+# SCENES must be defined -- run Cell 14 first, or paste your SCENES list here.
+try:
+    _resume_idx  = RESUME_SCENE_INDEX - 1   # convert to 0-based
+    _resume_scene = SCENES[_resume_idx]
+except (NameError, IndexError) as _e:
+    raise RuntimeError(
+        f"SCENES list not found or index {RESUME_SCENE_INDEX} out of range.\n"
+        f"  Fix: Run Cell 14 first to define SCENES, then re-run this cell.\n"
+        f"  Error: {_e}"
+    )
+
+# ── Continuity: extract last frame from previous scene video ─────────────────
+_resume_image_path = _resume_scene.get("image_path")
+
+if RESUME_PREV_VIDEO and os.path.exists(RESUME_PREV_VIDEO):
+    print(f"\U0001f39e\ufe0f  Extracting last frame from: {RESUME_PREV_VIDEO}")
+    _prev_tensor = get_last_frame_tensor(RESUME_PREV_VIDEO)
+    if _prev_tensor is not None:
+        _cont_path = f"/content/ComfyUI/input/_resume_s{RESUME_SCENE_INDEX:02d}_cont.jpg"
+        os.makedirs(os.path.dirname(_cont_path), exist_ok=True)
+        tensor_to_pil(_prev_tensor).save(_cont_path, "JPEG", quality=95)
+        _resume_image_path = _cont_path
+        print(f"   \u2713 Continuity frame saved: {_cont_path}")
+    else:
+        print(f"   \u26a0\ufe0f  Could not extract last frame from {RESUME_PREV_VIDEO} -- running T2V.")
+elif RESUME_PREV_VIDEO:
+    print(f"   \u26a0\ufe0f  RESUME_PREV_VIDEO not found: {RESUME_PREV_VIDEO} -- running T2V.")
+
+print(f"\n\U0001f3ac Resuming: Scene {RESUME_SCENE_INDEX}/{len(SCENES)}")
+print(f"   Input  : {_resume_scene.get('user_input','')[:80]}...")
+print(f"   Image  : {_resume_image_path or 'None (T2V)'}")
+print(f"   Seed   : {_resume_scene.get('seed', SEED)}")
+
+# ── Generate ──────────────────────────────────────────────────────────────────
+try:
+    _resume_output = generate_pro(
+        user_input           = _resume_scene.get("user_input", USER_INPUT),
+        image_path           = _resume_image_path,
+        positive_prompt      = _resume_scene.get("positive_prompt", POSITIVE_PROMPT),
+        negative_prompt      = _resume_scene.get("negative_prompt", NEGATIVE_PROMPT),
+        width                = _resume_scene.get("width",  WIDTH),
+        height               = _resume_scene.get("height", HEIGHT),
+        frames               = _resume_scene.get("frames", FRAMES),
+        fps                  = _resume_scene.get("fps",    FPS),
+        seed                 = _resume_scene.get("seed",   SEED),
+        image_strength       = _resume_scene.get("image_strength", IMAGE_STRENGTH),
+        character_image_path = _resume_scene.get("character_image_path", CHARACTER_IMAGE_PATH),
+        character_strength   = _resume_scene.get("character_strength",   CHARACTER_STRENGTH),
+        character_mode       = _resume_scene.get("character_mode", CHARACTER_CONSISTENCY_MODE),
+        character_name       = _resume_scene.get("character_name", CHARACTER_NAME),
+        character_description= _resume_scene.get("character_description", CHARACTER_DESCRIPTION),
+        output_prefix        = _resume_scene.get("output_prefix", f"Resume_S{RESUME_SCENE_INDEX:02d}"),
+    )
+
+    if _resume_output:
+        # ── Write/update checkpoint ──────────────────────────────────────────
+        _ckpt = {}
+        if os.path.exists(CHECKPOINT_FILE):
+            try:
+                with open(CHECKPOINT_FILE) as _f:
+                    _ckpt = json.load(_f)
+            except Exception:
+                pass
+        _ckpt[str(RESUME_SCENE_INDEX)] = _resume_output
+        try:
+            os.makedirs(os.path.dirname(CHECKPOINT_FILE), exist_ok=True)
+            with open(CHECKPOINT_FILE, "w") as _f:
+                json.dump(_ckpt, _f, indent=2)
+            print(f"   \U0001f4c4 Checkpoint updated: {CHECKPOINT_FILE}")
+        except Exception as _e:
+            print(f"   \u26a0\ufe0f  Could not write checkpoint: {_e}")
+
+        print(f"\n\u2705 Scene {RESUME_SCENE_INDEX} complete -> {_resume_output}")
+        if SHOW_PREVIEWS:
+            display_video(_resume_output)
+        if DOWNLOAD_AFTER_GENERATE:
+            try:
+                files.download(_resume_output)
+            except Exception as _e:
+                print(f"   \u26a0\ufe0f  Download failed: {_e}")
+    else:
+        print(f"\n\u274c Scene {RESUME_SCENE_INDEX} generation returned None.")
+
+except torch.cuda.OutOfMemoryError:
+    cleanup_memory()
+    print(f"\n\u274c CUDA OOM on Scene {RESUME_SCENE_INDEX}.")
+    print(f"   Try: LLM_MODEL='3B', USE_CHUNK_FF=True, FRAMES={FRAMES-24}, TILED_SPATIAL_TILES=4")
+
+except Exception as _e:
+    import traceback
+    print(f"\n\u274c Scene {RESUME_SCENE_INDEX} failed: {type(_e).__name__}: {_e}")
+    traceback.print_exc()
