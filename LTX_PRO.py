@@ -1,18 +1,18 @@
 # ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║  LTX-2 PRO — Complete Pipeline v1.0                                        ║
-# ║  Integrates: LD-I2V + SVI-Pro + EasyPrompt + Character Consistency          ║
-# ║  Base engine: LTX-2 19B Distilled GGUF Q4_K_M (Colab T4/L4/A100 safe)     ║
+# ║  LTX-2.3 PRO — Modified Infinite Flow Engine v1.0                          ║
+# ║  Integrates: LTX 2.3 models + Infinite Flow Engine + PRO features          ║
+# ║  Base engine: LTX-2.3 22B Dev GGUF Q4_K_M + Distilled LoRA (Colab T4 safe)║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 #
 # CELL ORDER:
 #   Cell 1 — Environment setup & custom nodes   (run once per session)
 #   Cell 2 — Model downloads                    (run once, skip if cached)
-#   Cell 3 — Imports, helpers & character system (run every session)
-#   Cell 4 — Easy Prompt + Vision settings      (edit to taste)
-#   Cell 5 — Character Consistency & LoRA config (edit per character)
+#   Cell 3 — Imports, helpers & engine classes   (run every session)
+#   Cell 4 — EasyPrompt & Vision configuration  (edit to taste)
+#   Cell 5 — Character & LoRA configuration     (edit per character)
 #   Cell 6 — Video generation configuration     (edit per video)
-#   Cell 7 — Define generate_pro()              (run once per session)
-#   Cell 8 — Storyboard / multi-scene runner    (optional)
+#   Cell 7 — Define generate_clip()             (run once per session)
+#   Cell 8 — InfiniteFlowEngine + Storyboard    (optional)
 #   Cell 9 — Run                                (re-run for each clip)
 
 
@@ -21,93 +21,71 @@
 # ══════════════════════════════════════════════════════════════════════════════
 
 # @title  { "single-column": true }
-# @markdown ## 💥 1. Prepare Environment & Install Custom Nodes
-# @markdown Clones all required ComfyUI repos including:
-# @markdown - **LTX2EasyPrompt-LD** (LTX2PromptArchitect + LTX2VisionDescribe)
-# @markdown - **LTX2-Master-Loader** (LTX2MasterLoaderLD 10-slot LoRA stacker)
-# @markdown - **ComfyUI-VideoHelperSuite** (VHS_VideoCombine output node)
-# @markdown - **ComfyUI-LTXVideo** (tiled VAE decode + AV helpers)
+# @markdown ## 1. Prepare Environment & Install Custom Nodes
+# @markdown Clones current ComfyUI (comfyanonymous) plus required custom nodes.
 
 # ── Base Python packages ──────────────────────────────────────────────────────
-!pip install torch torchvision torchaudio
+get_ipython().system("pip install torch torchvision torchaudio")
 
-%cd /content
+os.chdir("/content")
 from IPython.display import clear_output
 clear_output()
 
-!pip install -q torchsde einops diffusers accelerate nest_asyncio
-!pip install -q av spandrel albumentations onnx opencv-python onnxruntime
-!pip install -q imageio imageio-ffmpeg
+get_ipython().system("pip install -q torchsde einops diffusers accelerate nest_asyncio")
+get_ipython().system("pip install -q av spandrel albumentations onnx opencv-python onnxruntime")
+get_ipython().system("pip install -q imageio imageio-ffmpeg")
+get_ipython().system("pip install -q 'transformers>=4.43.0' accelerate qwen-vl-utils huggingface_hub")
 
-# Extra packages required by EasyPrompt & VisionDescribe nodes
-!pip install -q transformers>=4.43.0 accelerate qwen-vl-utils huggingface_hub
-
-# ── ComfyUI (pinned branch — matches reference notebook) ─────────────────────
-!git clone --branch ComfyUI_22_01_2026_v0.10.0 https://github.com/Isi-dev/ComfyUI.git
-!pip install -r /content/ComfyUI/requirements.txt -q
+# ── ComfyUI (current mainline — NOT pinned Isi-dev branch) ───────────────────
+get_ipython().system("git clone https://github.com/comfyanonymous/ComfyUI")
+get_ipython().system("pip install -r /content/ComfyUI/requirements.txt -q")
 clear_output()
 
 # ── Custom nodes ──────────────────────────────────────────────────────────────
-%cd /content/ComfyUI/custom_nodes
+os.chdir("/content/ComfyUI/custom_nodes")
 
-# Core KJNodes (pinned build — ImageResizeKJv2, PathchSageAttentionKJ, etc.)
-!git clone --branch kj_1.2.6               https://github.com/Isi-dev/ComfyUI_KJNodes
-# GGUF loader (UnetLoaderGGUF)
-!git clone --branch ComfyUI_GGUF_22_01_2026 https://github.com/Isi-dev/ComfyUI_GGUF.git
-# LTXVideo nodes (LTXVImgToVideoInplace, LTXVPreprocess, tiled VAE, etc.)
-!git clone https://github.com/Lightricks/ComfyUI-LTXVideo.git
-# LTX2EasyPrompt-LD — LTX2PromptArchitect + LTX2VisionDescribe
-!git clone https://github.com/seanhan19911990-source/LTX2EasyPrompt-LD.git
-# LTX2-Master-Loader — LTX2MasterLoaderLD (10-slot LoRA stacker)
-!git clone https://github.com/seanhan19911990-source/LTX2-Master-Loader.git
-# VideoHelperSuite — VHS_VideoCombine (h264-mp4, crf=19, yuv420p)
-!git clone https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git
+get_ipython().system("git clone https://github.com/kijai/ComfyUI-KJNodes")
+get_ipython().system("git clone https://github.com/city96/ComfyUI-GGUF")
+get_ipython().system("git clone https://github.com/Lightricks/ComfyUI-LTXVideo")
 
-# ── Install node requirements ─────────────────────────────────────────────────
-%cd /content/ComfyUI/custom_nodes/ComfyUI_KJNodes
-!pip install -r requirements.txt -q
+# Install node requirements
+os.chdir("/content/ComfyUI/custom_nodes/ComfyUI-KJNodes")
+get_ipython().system("pip install -r requirements.txt -q")
 
-%cd /content/ComfyUI/custom_nodes/ComfyUI_GGUF
-!pip install -r requirements.txt -q
+os.chdir("/content/ComfyUI/custom_nodes/ComfyUI-GGUF")
+get_ipython().system("pip install -r requirements.txt -q")
 
-%cd /content/ComfyUI/custom_nodes/ComfyUI-LTXVideo
-!pip install -r requirements.txt -q 2>/dev/null || true
-
-%cd /content/ComfyUI/custom_nodes/LTX2EasyPrompt-LD
-!pip install -r requirements.txt -q 2>/dev/null || true
-
-%cd /content/ComfyUI/custom_nodes/LTX2-Master-Loader
-!pip install -r requirements.txt -q 2>/dev/null || true
+os.chdir("/content/ComfyUI/custom_nodes/ComfyUI-LTXVideo")
+get_ipython().system("pip install -r requirements.txt -q 2>/dev/null || true")
 
 # ── System tools ──────────────────────────────────────────────────────────────
 import subprocess
+import os
+
 def install_apt_packages():
     packages = ["aria2", "ffmpeg"]
     try:
         subprocess.run(["apt-get", "-y", "install", "-qq"] + packages,
                        check=True, capture_output=True)
-        print("✓ apt packages installed")
+        print("apt packages installed")
     except subprocess.CalledProcessError as e:
-        print(f"✗ apt error: {e.stderr.decode().strip() or 'unknown'}")
+        print(f"apt error: {e.stderr.decode().strip() or 'unknown'}")
 
 print("Installing apt packages...")
 install_apt_packages()
 
 # ── Final setup ───────────────────────────────────────────────────────────────
-%cd /content/ComfyUI
+os.chdir("/content/ComfyUI")
 import os, sys
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 sys.path.insert(0, "/content/ComfyUI")
 
 clear_output()
-print("✅ Environment setup complete.")
+print("Environment setup complete.")
 print("   Custom nodes installed:")
-print("   ✓ ComfyUI_KJNodes    (kj_1.2.6)   — ImageResizeKJv2, PathchSageAttentionKJ")
-print("   ✓ ComfyUI_GGUF       (22_01_2026)  — UnetLoaderGGUF")
-print("   ✓ ComfyUI-LTXVideo   (Lightricks)  — LTXVImgToVideoInplace, tiled VAE")
-print("   ✓ LTX2EasyPrompt-LD  (LoRa Daddy)  — LTX2PromptArchitect, LTX2VisionDescribe")
-print("   ✓ LTX2-Master-Loader (LoRa Daddy)  — LTX2MasterLoaderLD")
-print("   ✓ ComfyUI-VideoHelperSuite          — VHS_VideoCombine")
+print("   - ComfyUI-KJNodes    (kijai)")
+print("   - ComfyUI-GGUF       (city96)")
+print("   - ComfyUI-LTXVideo   (Lightricks)")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -115,9 +93,8 @@ print("   ✓ ComfyUI-VideoHelperSuite          — VHS_VideoCombine")
 # ══════════════════════════════════════════════════════════════════════════════
 
 # @title  { "single-column": true }
-# @markdown ## 💥 2. Download All Model Weights
+# @markdown ## 2. Download All Model Weights (LTX 2.3)
 # @markdown Uses aria2c (fast parallel download). Skips files already cached.
-# @markdown **Pick ONE Gemma encoder** based on your GPU (see comments below).
 
 import os, subprocess
 from pathlib import Path
@@ -130,108 +107,185 @@ def model_download(url: str, dest_dir: str, filename: str = None,
         filename = url.split("/")[-1].split("?")[0]
     dest = os.path.join(dest_dir, filename)
     if os.path.exists(dest) and os.path.getsize(dest) > 1_000_000:
-        print(f"  ↳ cached: {filename}")
+        print(f"  cached: {filename}")
         return filename
     cmd = ["aria2c", "--console-log-level=error",
            "-c", "-x", "16", "-s", "16", "-k", "1M",
            "-d", dest_dir, "-o", filename]
     if silent:
         cmd += ["--summary-interval=0", "--quiet"]
-        print(f"  ↓ {filename}...", end=" ", flush=True)
+        print(f"  downloading {filename}...", end=" ", flush=True)
     cmd.append(url)
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        print(f"\n  ❌ Failed: {result.stderr.strip()}")
+        print(f"\n  FAILED: {result.stderr.strip()}")
         return False
     if silent:
         print("done.")
     return filename
 
+
+def download_civitai_model(civitai_link, civitai_token, folder="/content/ComfyUI/models/loras"):
+    """Download a model from Civitai with token authentication."""
+    import time
+    os.makedirs(folder, exist_ok=True)
+    try:
+        model_id = civitai_link.split("/models/")[1].split("?")[0]
+    except IndexError:
+        raise ValueError("Invalid Civitai URL format.")
+    civitai_url = f"https://civitai.com/api/download/models/{model_id}?type=Model&format=SafeTensor"
+    if civitai_token:
+        civitai_url += f"&token={civitai_token}"
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    filename = f"model_{timestamp}.safetensors"
+    full_path = os.path.join(folder, filename)
+    download_command = f'wget --max-redirect=10 --show-progress "{civitai_url}" -O "{full_path}"'
+    print("Downloading from Civitai...")
+    os.system(download_command)
+    if os.path.exists(full_path) and os.path.getsize(full_path) > 0:
+        print(f"LoRA downloaded: {full_path}")
+    else:
+        print(f"LoRA download failed: {full_path}")
+    return filename
+
+
+def download_lora(link, folder="/content/ComfyUI/models/loras", civitai_token=None):
+    """Download a LoRA file, auto-detecting Civitai vs huggingface URLs."""
+    if "civitai.com" in link.lower():
+        if not civitai_token:
+            raise ValueError("Civitai token is required for Civitai downloads")
+        return download_civitai_model(link, civitai_token, folder)
+    else:
+        return model_download(link, folder)
+
+
 # ── Source base URLs ──────────────────────────────────────────────────────────
-KIJAI    = "https://huggingface.co/Kijai/LTXV2_comfy/resolve/main"
-KIJAI23  = "https://huggingface.co/Kijai/LTX2.3_comfy/resolve/main"
+UNSLOTH  = "https://huggingface.co/unsloth"
 COMFYORG = "https://huggingface.co/Comfy-Org/ltx-2/resolve/main/split_files"
 LIGHTRIX = "https://huggingface.co/Lightricks"
+KIJAI23  = "https://huggingface.co/Kijai/LTX2.3_comfy/resolve/main"
 
-print("── Core model downloads ──────────────────────────────────────────────────")
+UNET_D   = "/content/ComfyUI/models/unet"
+TE_D     = "/content/ComfyUI/models/text_encoders"
+VAE_D    = "/content/ComfyUI/models/vae"
+UPD      = "/content/ComfyUI/models/latent_upscale_models"
+LORA_DIR = "/content/ComfyUI/models/loras"
 
-# ── UNet: GGUF Q4_K_M distilled ──────────────────────────────────────────────
-# LTX-2 19B distilled — baked-in distillation, no separate distill LoRA needed
-# Node [197] UnetLoaderGGUF in LD-I2V.json
+print("-- Core LTX 2.3 model downloads --")
+
+# ── UNet: LTX 2.3 22B Dev GGUF Q4_K_M ────────────────────────────────────────
 dit_model = model_download(
-    f"{KIJAI}/diffusion_models/ltx-2-19b-distilled_Q4_K_M.gguf",
-    "/content/ComfyUI/models/unet")
+    f"{UNSLOTH}/LTX-2.3-GGUF/resolve/main/ltx-2.3-22b-dev-Q4_K_M.gguf",
+    UNET_D)
 
 # ── Text encoders ─────────────────────────────────────────────────────────────
-# Gemma fp4 — RTX 5000 Blackwell. Use fp8 for T4/A100 (uncomment below).
+# Primary: Gemma fp8 + LTX 2.3 embeddings connector
 text_encoder_model = model_download(
-    f"{COMFYORG}/text_encoders/gemma_3_12B_it_fp4_mixed.safetensors",
-    "/content/ComfyUI/models/text_encoders")
-# Gemma fp8 — T4 / A100 / RTX 3000-4000 (uncomment if fp4 OOMs):
-# text_encoder_model = model_download(
-#     f"{COMFYORG}/text_encoders/gemma_3_12B_it_fp8_scaled.safetensors",
-#     "/content/ComfyUI/models/text_encoders")
+    f"{COMFYORG}/text_encoders/gemma_3_12B_it_fp8_scaled.safetensors",
+    TE_D)
 
-# Embeddings connector — distilled version (must match GGUF)
-text_encoder2_model = model_download(
-    f"{KIJAI}/text_encoders/ltx-2-19b-embeddings_connector_distill_bf16.safetensors",
-    "/content/ComfyUI/models/text_encoders")
+# LTX 2.3 embeddings connector (pairs with safetensors Gemma)
+text_encoder_connector = model_download(
+    f"{UNSLOTH}/LTX-2.3-GGUF/resolve/main/text_encoders/ltx-2.3-22b-dev_embeddings_connectors.safetensors",
+    TE_D)
+
+# GGUF Gemma fallback pair
+text_encoder_gguf_model = model_download(
+    f"{UNSLOTH}/gemma-3-12b-it-qat-GGUF/resolve/main/gemma-3-12b-it-qat-UD-Q4_K_XL.gguf",
+    TE_D)
+text_encoder_mmproj = model_download(
+    f"{UNSLOTH}/gemma-3-12b-it-qat-GGUF/resolve/main/mmproj-BF16.gguf",
+    TE_D)
 
 # ── VAEs ──────────────────────────────────────────────────────────────────────
 vae_model = model_download(
-    f"{KIJAI}/VAE/LTX2_video_vae_bf16.safetensors",
-    "/content/ComfyUI/models/vae")
+    f"{UNSLOTH}/LTX-2.3-GGUF/resolve/main/vae/ltx-2.3-22b-dev_video_vae.safetensors",
+    VAE_D)
 
 vae_audio_model = model_download(
-    f"{KIJAI}/VAE/LTX2_audio_vae_bf16.safetensors",
-    "/content/ComfyUI/models/vae")
+    f"{UNSLOTH}/LTX-2.3-GGUF/resolve/main/vae/ltx-2.3-22b-dev_audio_vae.safetensors",
+    VAE_D)
 
-# TaeEncoder preview VAE (fast latent preview)
+# TaeVAE preview
 taeltx2_model = model_download(
     f"{KIJAI23}/vae/taeltx2_3.safetensors",
-    "/content/ComfyUI/models/vae")
+    VAE_D)
 
 # ── Spatial upscaler ──────────────────────────────────────────────────────────
 upscaler_model = model_download(
-    f"{LIGHTRIX}/LTX-2/resolve/main/ltx-2-spatial-upscaler-x2-1.0.safetensors",
-    "/content/ComfyUI/models/latent_upscale_models")
+    f"{LIGHTRIX}/LTX-2.3/resolve/main/ltx-2.3-spatial-upscaler-x2-1.0.safetensors",
+    UPD)
+
+# ── Distilled LoRA (mandatory - always applied first) ─────────────────────────
+distilled_lora_model = model_download(
+    f"{LIGHTRIX}/LTX-2.3/resolve/main/ltx-2.3-22b-distilled-lora-384.safetensors",
+    LORA_DIR)
 
 # ── IC LoRAs + Camera Control LoRAs ──────────────────────────────────────────
-# All used by LTX2MasterLoaderLD node [263] in LD-I2V.json
 LORA_URLS = {
     "Detailer":    f"{LIGHTRIX}/LTX-2-19b-IC-LoRA-Detailer/resolve/main/ltx-2-19b-ic-lora-detailer.safetensors",
     "Canny":       f"{LIGHTRIX}/LTX-2-19b-IC-LoRA-Canny-Control/resolve/main/ltx-2-19b-ic-lora-canny-control.safetensors",
     "Depth":       f"{LIGHTRIX}/LTX-2-19b-IC-LoRA-Depth-Control/resolve/main/ltx-2-19b-ic-lora-depth-control.safetensors",
     "Pose":        f"{LIGHTRIX}/LTX-2-19b-IC-LoRA-Pose-Control/resolve/main/ltx-2-19b-ic-lora-pose-control.safetensors",
     "Dolly-In":    f"{LIGHTRIX}/LTX-2-19b-LoRA-Camera-Control-Dolly-In/resolve/main/ltx-2-19b-lora-camera-control-dolly-in.safetensors",
-    "Dolly-Left":  f"{LIGHTRIX}/LTX-2-19b-LoRA-Camera-Control-Dolly-Left/resolve/main/ltx-2-19b-lora-camera-control-dolly-left.safetensors",
     "Dolly-Out":   f"{LIGHTRIX}/LTX-2-19b-LoRA-Camera-Control-Dolly-Out/resolve/main/ltx-2-19b-lora-camera-control-dolly-out.safetensors",
+    "Dolly-Left":  f"{LIGHTRIX}/LTX-2-19b-LoRA-Camera-Control-Dolly-Left/resolve/main/ltx-2-19b-lora-camera-control-dolly-left.safetensors",
     "Dolly-Right": f"{LIGHTRIX}/LTX-2-19b-LoRA-Camera-Control-Dolly-Right/resolve/main/ltx-2-19b-lora-camera-control-dolly-right.safetensors",
-    "Jib-Down":    f"{LIGHTRIX}/LTX-2-19b-LoRA-Camera-Control-Jib-Down/resolve/main/ltx-2-19b-lora-camera-control-jib-down.safetensors",
     "Jib-Up":      f"{LIGHTRIX}/LTX-2-19b-LoRA-Camera-Control-Jib-Up/resolve/main/ltx-2-19b-lora-camera-control-jib-up.safetensors",
+    "Jib-Down":    f"{LIGHTRIX}/LTX-2-19b-LoRA-Camera-Control-Jib-Down/resolve/main/ltx-2-19b-lora-camera-control-jib-down.safetensors",
     "Static":      f"{LIGHTRIX}/LTX-2-19b-LoRA-Camera-Control-Static/resolve/main/ltx-2-19b-lora-camera-control-static.safetensors",
 }
 
-LORA_DIR = "/content/ComfyUI/models/loras"
 os.makedirs(LORA_DIR, exist_ok=True)
-print(f"\n── LoRA batch download ({len(LORA_URLS)} files) ─────────────────────────────────")
+print(f"\n-- LoRA batch download ({len(LORA_URLS)} files) --")
 for name, url in LORA_URLS.items():
     r = model_download(url, LORA_DIR)
-    print(f"   {'✅' if r else '❌'}  {name}")
+    print(f"   {'OK' if r else 'FAIL'}  {name}")
 
-print("\n✅ All model files downloaded.")
+# ── User LoRAs (3 slots with civitai support) ─────────────────────────────────
+# @markdown ### User LoRA Downloads
+download_loRA_1 = False  # @param {type:"boolean"}
+lora_1_download_url = ""  # @param {"type":"string"}
+download_loRA_2 = False  # @param {type:"boolean"}
+lora_2_download_url = ""  # @param {"type":"string"}
+download_loRA_3 = False  # @param {type:"boolean"}
+lora_3_download_url = ""  # @param {"type":"string"}
+token_if_civitai_url = ""  # @param {"type":"string"}
+
+user_lora_1 = None
+user_lora_2 = None
+user_lora_3 = None
+
+valid_extensions = {'.safetensors', '.ckpt', '.pt', '.pth', '.sft'}
+
+if download_loRA_1 and lora_1_download_url:
+    user_lora_1 = download_lora(lora_1_download_url, civitai_token=token_if_civitai_url)
+    if user_lora_1 and not any(user_lora_1.lower().endswith(ext) for ext in valid_extensions):
+        user_lora_1 = None
+
+if download_loRA_2 and lora_2_download_url:
+    user_lora_2 = download_lora(lora_2_download_url, civitai_token=token_if_civitai_url)
+    if user_lora_2 and not any(user_lora_2.lower().endswith(ext) for ext in valid_extensions):
+        user_lora_2 = None
+
+if download_loRA_3 and lora_3_download_url:
+    user_lora_3 = download_lora(lora_3_download_url, civitai_token=token_if_civitai_url)
+    if user_lora_3 and not any(user_lora_3.lower().endswith(ext) for ext in valid_extensions):
+        user_lora_3 = None
+
+print("\nAll models ready.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CELL 3  ─  IMPORTS, HELPERS & CHARACTER CONSISTENCY SYSTEM
+# CELL 3  ─  IMPORTS, HELPERS & ENGINE CLASSES
 # ══════════════════════════════════════════════════════════════════════════════
 
 # @title  { "single-column": true }
-# @markdown ## 💥 3. Imports, Helpers & Character Consistency System
-# @markdown Loads all helpers, VRAM utilities, node wrappers, and the
-# @markdown **Character Consistency** system used in `generate_pro()`.
+# @markdown ## 3. Imports, Helpers & Engine Classes
+# @markdown All utility functions, VisionDescribeEngine, EasyPromptEngine,
+# @markdown CharacterBible, and PRO feature functions.
 
-import os, sys, gc, time, json, shutil, warnings, subprocess, asyncio
+import os, sys, gc, re, json, time, shutil, warnings, subprocess, asyncio
 import numpy as np
 import torch
 import cv2
@@ -246,72 +300,110 @@ warnings.filterwarnings("ignore")
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 sys.path.insert(0, "/content/ComfyUI")
 
-# ── ComfyUI core ──────────────────────────────────────────────────────────────
 from nodes import NODE_CLASS_MAPPINGS, LoraLoaderModelOnly
 import folder_paths
 
-# ── Async node loader (Jupyter/Colab safe) ────────────────────────────────────
-def import_custom_nodes() -> None:
-    """Load all built-in and external custom nodes in a Jupyter/Colab-safe way."""
-    import nest_asyncio
-    from nodes import init_builtin_extra_nodes, init_external_custom_nodes
 
-    async def _load():
-        failed = await init_builtin_extra_nodes()
-        await init_external_custom_nodes()
-        if failed:
-            print(f"   ⚠️  Some nodes failed: {[str(n) for n in failed]}")
-    try:
-        asyncio.run(_load())
-    except RuntimeError:
-        nest_asyncio.apply()
-        asyncio.get_event_loop().run_until_complete(_load())
+# ══════════════════════════════════════════════════════════════════════════════
+# UTILITY FUNCTIONS
+# ══════════════════════════════════════════════════════════════════════════════
 
-# ── VRAM helpers ──────────────────────────────────────────────────────────────
-def cleanup_memory(verbose: bool = False) -> None:
-    """Enhanced memory cleanup including ipc_collect for fragmentation."""
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
-        torch.cuda.ipc_collect()   # free IPC handles — reduces fragmentation
-    if verbose:
-        _print_vram()
-
-def _print_vram() -> None:
-    if not torch.cuda.is_available():
-        return
-    used  = torch.cuda.memory_allocated() / 1024**3
-    total = torch.cuda.get_device_properties(0).total_memory / 1024**3
-    pct   = used / total * 100 if total > 0 else 0
-    filled = int(20 * used / total) if total > 0 else 0
-    bar   = "█" * filled + "░" * (20 - filled)
-    print(f"   💾 VRAM [{bar}] {used:.1f}/{total:.1f} GB ({pct:.1f}%)")
-
-# ── ComfyUI node output accessor ──────────────────────────────────────────────
 def get_value_at_index(obj: Union[Sequence, Mapping], index: int) -> Any:
+    """Returns the value at the given index of a sequence or mapping."""
     try:
         return obj[index]
     except KeyError:
         return obj["result"][index]
 
+
+def tensor_width_height(image):
+    """Return (width, height) for a ComfyUI image tensor in NHWC or HWC format.
+
+    Newer ComfyUI/LTXVideo builds may not register the old GetImageSize node, so
+    use tensor shape directly instead of depending on that optional custom node.
+    """
+    if isinstance(image, (tuple, list)):
+        image = get_value_at_index(image, 0)
+    if image.ndim == 4:      # (N, H, W, C)
+        return int(image.shape[2]), int(image.shape[1])
+    if image.ndim == 3:      # (H, W, C)
+        return int(image.shape[1]), int(image.shape[0])
+    raise ValueError(f"Unsupported image tensor shape: {getattr(image, 'shape', None)}")
+
+
+def load_audio_vae_compat(vae_name):
+    """Load the LTX audio VAE across ComfyUI/KJNodes versions."""
+    if "VAELoaderKJ" in NODE_CLASS_MAPPINGS:
+        print("Loading audio VAE with VAELoaderKJ...")
+        loader = NODE_CLASS_MAPPINGS["VAELoaderKJ"]()
+        return loader.load_vae(vae_name=vae_name, device="main_device", weight_dtype="fp16")
+    if "VAELoader" in NODE_CLASS_MAPPINGS:
+        print("VAELoaderKJ not found; loading audio VAE with built-in VAELoader...")
+        loader = NODE_CLASS_MAPPINGS["VAELoader"]()
+        return loader.load_vae(vae_name=vae_name)
+    candidates = sorted(k for k in NODE_CLASS_MAPPINGS.keys() if "vae" in k.lower() and "load" in k.lower())
+    raise KeyError("No compatible VAE loader found. Available: " + ", ".join(candidates))
+
+
+# ── VRAM management ───────────────────────────────────────────────────────────
+def cleanup_memory(verbose: bool = False):
+    """Enhanced memory cleanup."""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        torch.cuda.ipc_collect()
+    gc.collect()
+    if verbose:
+        _print_vram()
+
+
+def purge_vram(label: str = ""):
+    """Purge VRAM after model loading phases."""
+    tag = f" [{label}]" if label else ""
+    if "LayerUtility: PurgeVRAM V2" in NODE_CLASS_MAPPINGS:
+        try:
+            node = NODE_CLASS_MAPPINGS["LayerUtility: PurgeVRAM V2"]()
+            fn = getattr(node, node.FUNCTION)
+            fn()
+            print(f"   VRAM purged via PurgeVRAM V2{tag}")
+            return
+        except Exception:
+            pass
+    cleanup_memory()
+    print(f"   VRAM cleared via torch.cuda.empty_cache{tag}")
+
+
+def _print_vram():
+    if not torch.cuda.is_available():
+        return
+    used = torch.cuda.memory_allocated() / 1024**3
+    total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+    filled = int(20 * used / total) if total > 0 else 0
+    bar = "#" * filled + "." * (20 - filled)
+    print(f"   VRAM [{bar}] {used:.1f}/{total:.1f} GB")
+
+
 # ── Tensor / image conversion ─────────────────────────────────────────────────
 def pil_to_tensor(img: Image.Image) -> torch.Tensor:
-    """PIL → ComfyUI NHWC float tensor."""
+    """PIL -> ComfyUI NHWC float tensor."""
     arr = np.array(img.convert("RGB")).astype(np.float32) / 255.0
     return torch.from_numpy(arr).unsqueeze(0)
 
+
 def tensor_to_pil(t: torch.Tensor) -> Image.Image:
-    """ComfyUI NHWC tensor → PIL."""
+    """ComfyUI NHWC tensor -> PIL."""
     if t.ndim == 4:
         t = t[0]
     return Image.fromarray((t.cpu().numpy() * 255).clip(0, 255).astype(np.uint8), "RGB")
+
 
 def load_image_tensor(path: str) -> Optional[torch.Tensor]:
     """Load an image file as a ComfyUI NHWC tensor. Returns None if missing."""
     if not path or not os.path.exists(path):
         return None
     return pil_to_tensor(Image.open(path).convert("RGB"))
+
 
 def get_last_frame_tensor(video_path: str) -> Optional[torch.Tensor]:
     """Extract last frame of a video as NHWC float tensor shape (1,H,W,3)."""
@@ -329,10 +421,12 @@ def get_last_frame_tensor(video_path: str) -> Optional[torch.Tensor]:
     frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     return torch.from_numpy(frame).float().unsqueeze(0) / 255.0
 
-# ── Video display & saving ────────────────────────────────────────────────────
-def display_video(path: str) -> None:
+
+# ── Video helpers ─────────────────────────────────────────────────────────────
+def display_video(path: str):
+    """Display video inline in Colab."""
     if not path or not os.path.exists(path):
-        print(f"   ⚠️  Not found: {path}")
+        print(f"   Not found: {path}")
         return
     data = b64encode(open(path, "rb").read()).decode()
     display(HTML(
@@ -341,498 +435,864 @@ def display_video(path: str) -> None:
         '</video>'
     ))
 
-def save_video_from_components(video_obj, prefix="LTX-2-PRO") -> str:
+
+def save_video_from_components(video_obj, prefix="LTX-2.3-PRO") -> str:
     """Save a ComfyUI video object and return the output path."""
     from comfy_api.latest import Types
     w, h = video_obj.get_dimensions()
     folder, fname, ctr, _, _ = folder_paths.get_save_image_path(
         prefix, folder_paths.get_output_directory(), w, h)
-    ext  = Types.VideoContainer.get_extension("auto")
+    ext = Types.VideoContainer.get_extension("auto")
     path = os.path.join(folder, f"{fname}_{ctr:05}_.{ext}")
     video_obj.save_to(path, format=Types.VideoContainer("auto"),
                       codec="auto", metadata=None)
     return path
 
-# ── Metadata JSON sidecar ─────────────────────────────────────────────────────
-def save_metadata_sidecar(output_path: str, meta: dict) -> str:
-    """Write a .json sidecar file next to the generated video."""
-    sidecar = os.path.splitext(output_path)[0] + "_meta.json"
+
+def concatenate_clips(clip_paths: List[str], output_path: str) -> str:
+    """ffmpeg concat all clips into one final video."""
+    list_file = "/tmp/concat_list.txt"
+    with open(list_file, "w") as f:
+        for p in clip_paths:
+            f.write(f"file '{p}'\n")
+    subprocess.run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_file,
+                    "-c", "copy", output_path], check=True, capture_output=True)
+    print(f"   Concatenated -> {output_path}")
+    return output_path
+
+
+# ── ComfyUI async node loader ─────────────────────────────────────────────────
+_NODES_LOADED = False
+
+
+def import_custom_nodes() -> None:
+    """Load all built-in and external custom nodes in a Jupyter/Colab-safe way."""
+    global _NODES_LOADED
+    if _NODES_LOADED:
+        return
+    import nest_asyncio
+    from nodes import init_builtin_extra_nodes, init_external_custom_nodes
+
+    async def _load():
+        failed = await init_builtin_extra_nodes()
+        await init_external_custom_nodes()
+        if failed:
+            print(f"   Node failures: {failed}")
+
     try:
-        with open(sidecar, "w", encoding="utf-8") as f:
-            json.dump(meta, f, indent=2, default=str)
-        print(f"   📄 Metadata: {sidecar}")
-    except Exception as e:
-        print(f"   ⚠️  Could not save metadata: {e}")
-    return sidecar
+        asyncio.run(_load())
+    except RuntimeError:
+        nest_asyncio.apply()
+        asyncio.get_event_loop().run_until_complete(_load())
+    _NODES_LOADED = True
 
-# ── Model file validator ──────────────────────────────────────────────────────
-def validate_model_files(model_dict: dict) -> bool:
-    """
-    Check required model files exist in ComfyUI folder_paths.
-    model_dict: { label: filename }
-    Returns True only if all files are found.
-    """
-    folder_map = {
-        "unet"    : "unet",
-        "clip1"   : "text_encoders",
-        "clip2"   : "text_encoders",
-        "vae_vid" : "vae",
-        "vae_aud" : "vae",
-        "upscaler": "latent_upscale_models",
-    }
-    ok = True
-    for label, filename in model_dict.items():
-        fk    = folder_map.get(label, "loras")
-        found = any(
-            os.path.exists(os.path.join(base, filename))
-            for base in folder_paths.get_folder_paths(fk)
-        )
-        print(f"   {'✅' if found else '❌'} [{label:9s}] {filename}")
-        if not found:
-            ok = False
-    return ok
 
-# ── Memory / attention performance patches ────────────────────────────────────
+# ── Performance patches ───────────────────────────────────────────────────────
 def apply_sage_attention(unet):
-    """
-    Apply PathchSageAttentionKJ (KJNodes) for flash-attention-style speedup.
-    Node: PathchSageAttentionKJ from ComfyUI_KJNodes.
-    Falls back silently if node is not available.
-    """
-    if not USE_SAGE_ATTENTION:
-        return unet
+    """Apply PathchSageAttentionKJ if available."""
     if "PathchSageAttentionKJ" not in NODE_CLASS_MAPPINGS:
-        print("   ⚠️  PathchSageAttentionKJ not found — skipping sage attention.")
         return unet
     try:
-        node  = NODE_CLASS_MAPPINGS["PathchSageAttentionKJ"]()
-        fn    = getattr(node, node.FUNCTION)
-        unet  = get_value_at_index(fn(model=unet), 0)
-        print("   ✓ SageAttention patch applied (PathchSageAttentionKJ)")
+        node = NODE_CLASS_MAPPINGS["PathchSageAttentionKJ"]()
+        fn = getattr(node, node.FUNCTION)
+        unet = get_value_at_index(fn(model=unet), 0)
+        print("   SageAttention patch applied")
     except Exception as e:
-        print(f"   ⚠️  SageAttention failed ({e}) — continuing without it.")
+        print(f"   SageAttention failed ({e})")
     return unet
+
 
 def apply_chunk_ff(unet):
-    """
-    Apply LTXVChunkFeedForward for memory-efficient chunk-based feedforward.
-    Node: LTXVChunkFeedForward from ComfyUI-LTXVideo.
-    Falls back silently if node is not available.
-    """
-    if not USE_CHUNK_FF:
-        return unet
+    """Apply LTXVChunkFeedForward if available."""
     if "LTXVChunkFeedForward" not in NODE_CLASS_MAPPINGS:
-        print("   ⚠️  LTXVChunkFeedForward not found — skipping chunk FF.")
         return unet
     try:
-        node  = NODE_CLASS_MAPPINGS["LTXVChunkFeedForward"]()
-        fn    = getattr(node, node.FUNCTION)
-        unet  = get_value_at_index(fn(model=unet), 0)
-        print("   ✓ ChunkFeedForward patch applied (LTXVChunkFeedForward)")
+        node = NODE_CLASS_MAPPINGS["LTXVChunkFeedForward"]()
+        fn = getattr(node, node.FUNCTION)
+        unet = get_value_at_index(fn(model=unet), 0)
+        print("   ChunkFeedForward patch applied")
     except Exception as e:
-        print(f"   ⚠️  ChunkFeedForward failed ({e}) — continuing without it.")
+        print(f"   ChunkFeedForward failed ({e})")
     return unet
 
-def purge_vram(label: str = "") -> None:
-    """
-    Purge VRAM after model loading phases.
-    Tries LayerUtility: PurgeVRAM V2 first, then torch.cuda.empty_cache() fallback.
-    Node: LayerUtility: PurgeVRAM V2
-    """
-    if not PURGE_VRAM_AFTER_MODELS:
-        return
-    tag = f" [{label}]" if label else ""
-    if "LayerUtility: PurgeVRAM V2" in NODE_CLASS_MAPPINGS:
-        try:
-            node = NODE_CLASS_MAPPINGS["LayerUtility: PurgeVRAM V2"]()
-            fn   = getattr(node, node.FUNCTION)
-            fn()
-            print(f"   ✓ VRAM purged via PurgeVRAM V2{tag}")
-            return
-        except Exception as e:
-            print(f"   ⚠️  PurgeVRAM V2 failed ({e}) — using torch fallback.")
-    cleanup_memory()
-    print(f"   ✓ VRAM cleared via torch.cuda.empty_cache{tag}")
 
-# ── Upload helper ─────────────────────────────────────────────────────────────
-def upload_image(save_dir="/content/ComfyUI/input") -> Optional[str]:
-    os.makedirs(save_dir, exist_ok=True)
-    uploaded = files.upload()
-    for fname, data in uploaded.items():
-        path = os.path.join(save_dir, fname)
-        with open(path, "wb") as f:
-            f.write(data)
-        print(f"   ✓ Saved: {path}")
-        return path
-    return None
+# ══════════════════════════════════════════════════════════════════════════════
+# VISION DESCRIBE ENGINE
+# Standalone Qwen2.5-VL wrapper. Loads -> describes -> unloads to free VRAM.
+# ══════════════════════════════════════════════════════════════════════════════
 
-# ── Audio VAE loader with KJNodes fallback ────────────────────────────────────
-def _load_audio_vae(vae_name: str):
-    """Load audio VAE. Prefers VAELoaderKJ (main_device, fp16), falls back to VAELoader."""
-    if "VAELoaderKJ" in NODE_CLASS_MAPPINGS:
-        return NODE_CLASS_MAPPINGS["VAELoaderKJ"]().load_vae(
-            vae_name=vae_name, device="main_device", weight_dtype="fp16")
-    return NODE_CLASS_MAPPINGS["VAELoader"]().load_vae(vae_name=vae_name)
+class VisionDescribeEngine:
+    """Analyses an image and returns a 100-130 word scene description."""
 
+    MODEL_OPTIONS = {
+        "3B-fast": "huihui-ai/Qwen2.5-VL-3B-Instruct-abliterated",
+        "7B-nsfw": "prithivMLmods/Qwen2.5-VL-7B-Abliterated-Caption-it",
+    }
 
-# ──────────────────────────────────────────────────────────────────────────────
-# LoRA stack helpers (LTX2MasterLoaderLD + manual fallback)
-# Mirrors node [263] LTX2MasterLoaderLD in LD-I2V.json
-# ──────────────────────────────────────────────────────────────────────────────
-
-# IC LoRA filename lookup (slot 1)
-_IC_LORA_FILES: Dict[str, str] = {
-    "none":     "None",
-    "detailer": "ltx-2-19b-ic-lora-detailer.safetensors",
-    "canny":    "ltx-2-19b-ic-lora-canny-control.safetensors",
-    "depth":    "ltx-2-19b-ic-lora-depth-control.safetensors",
-    "pose":     "ltx-2-19b-ic-lora-pose-control.safetensors",
-}
-
-# Camera LoRA filename lookup (slot 2)
-_CAMERA_LORA_FILES: Dict[str, str] = {
-    "none":        "None",
-    "dolly-in":    "ltx-2-19b-lora-camera-control-dolly-in.safetensors",
-    "dolly-out":   "ltx-2-19b-lora-camera-control-dolly-out.safetensors",
-    "dolly-left":  "ltx-2-19b-lora-camera-control-dolly-left.safetensors",
-    "dolly-right": "ltx-2-19b-lora-camera-control-dolly-right.safetensors",
-    "jib-up":      "ltx-2-19b-lora-camera-control-jib-up.safetensors",
-    "jib-down":    "ltx-2-19b-lora-camera-control-jib-down.safetensors",
-    "static":      "ltx-2-19b-lora-camera-control-static.safetensors",
-}
-
-def _build_lora_stack(ic_lora: str, ic_strength: float,
-                      camera_lora: str, camera_strength: float) -> List[Dict]:
-    """
-    Build the 10-slot LoRA stack from IC and Camera dropdown selections.
-    Slot 1 = IC LoRA, Slot 2 = Camera LoRA, Slots 3-10 = empty.
-    """
-    ic_file  = _IC_LORA_FILES.get(ic_lora.lower(), "None")
-    cam_file = _CAMERA_LORA_FILES.get(camera_lora.lower(), "None")
-    stack = [
-        {"on": ic_file  != "None", "lora": ic_file,  "guard": False, "strength": ic_strength},
-        {"on": cam_file != "None", "lora": cam_file, "guard": False, "strength": camera_strength},
-    ]
-    for _ in range(8):
-        stack.append({"on": False, "lora": "None", "guard": False, "strength": 1.0})
-    return stack
-
-
-def apply_lora_stack(unet, clip_model,
-                     lora_stack: Optional[List[Dict]] = None,
-                     lora_stack_json: Optional[str] = None):
-    """
-    Apply LoRA stack via LTX2MasterLoaderLD node when available.
-    Falls back to manual LoraLoaderModelOnly loop if the node is missing.
-    Returns: (unet, clip_model)
-    """
-    stack = lora_stack or []
-    active = [s for s in stack
-              if s.get("on") and s.get("lora") not in (None, "None", "")]
-
-    if not active:
-        print("   ℹ️  No active LoRAs in stack — skipping.")
-        return unet, clip_model
-
-    # ── Try LTX2MasterLoaderLD node [263] (LoRa Daddy) ───────────────────────
-    if "LTX2MasterLoaderLD" in NODE_CLASS_MAPPINGS:
-        print(f"   [MasterLoader] {len(active)} LoRA(s) via LTX2MasterLoaderLD…")
-        try:
-            node   = NODE_CLASS_MAPPINGS["LTX2MasterLoaderLD"]()
-            fn     = getattr(node, node.FUNCTION)
-            # NOTE: 'stack_data' is the expected kwarg name for LTX2-Master-Loader.
-            # If the node's API differs (e.g. 'lora_stack'), a TypeError is raised
-            # and caught below — the manual fallback loop is then used instead.
-            result = fn(
-                model=unet,
-                clip=clip_model,
-                stack_data=lora_stack_json or json.dumps(stack),
-            )
-            unet = get_value_at_index(result, 0)
-            print("   [MasterLoader] ✓  Stack applied.")
-            return unet, clip_model
-        except TypeError as e:
-            print(f"   [MasterLoader] ⚠️  kwarg mismatch ({e}).")
-            print("      Falling back to manual LoRA loop.")
-            print("      Check LTX2-Master-Loader node signature — expected 'stack_data'.")
-        except Exception as e:
-            print(f"   [MasterLoader] ⚠️  Node failed ({e}) — manual fallback.")
-
-    # ── Fallback: LoraLoaderModelOnly loop ────────────────────────────────────
-    print(f"   [MasterLoader] {len(active)} LoRA(s) via manual loop…")
-    for slot in active:
-        name, strength, guard = slot["lora"], slot.get("strength", 1.0), slot.get("guard", False)
-        try:
-            ll   = LoraLoaderModelOnly()
-            unet = ll.load_lora_model_only(unet, name, strength)[0]
-            print(f"      ✓ {name} @ {strength}")
-        except Exception as e:
-            if guard:
-                print(f"      ⚠️  {name} skipped (guard): {e}")
-            else:
-                print(f"      ❌ {name} failed: {e}")
-
-    return unet, clip_model
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# EasyPrompt + VisionDescribe wrappers (from LTX2EasyPrompt-LD nodes)
-# Maps to LTX2PromptArchitect + LTX2VisionDescribe node types
-# ──────────────────────────────────────────────────────────────────────────────
-
-_LLM_LABEL_MAP = {
-    "8B":  "8B - NeuralDaredevil (High Quality)",
-    "3B":  "3B - Llama-3.2 Abliterated (Low VRAM)",
-    "14B": "14B - Qwen3 Abliterated (High VRAM)",
-}
-_VISION_LABEL_MAP = {
-    "3B-fast": "Qwen2.5-VL-3B — Fast (huihui abliterated)",
-    "7B-nsfw": "Qwen2.5-VL-7B — Better NSFW (prithiv caption)",
-}
-_CREATIVITY_MAP = {
-    0.7: "0.7 - Literal & Grounded",
-    0.9: "0.9 - Balanced Professional",
-    1.1: "1.1 - Artistic Expansion",
-}
-
-def _creativity_label(c: float) -> str:
-    closest = min(_CREATIVITY_MAP.keys(), key=lambda x: abs(x - c))
-    return _CREATIVITY_MAP[closest]
-
-
-def run_easy_prompt(user_input: str, frame_count: int, seed: int,
-                    scene_context: str = "",
-                    llm_model_override: str = None) -> Tuple[str, str]:
-    """
-    Calls LTX2PromptArchitect (node type: LTX2PromptArchitect from LTX2EasyPrompt-LD)
-    to expand a simple story description into a dense cinematic prompt.
-
-    Falls back to returning the raw input if the node is unavailable.
-    LLM is loaded, run, then unloaded to free VRAM for the video model.
-
-    llm_model_override: when provided, overrides the LLM_MODEL global for this call.
-    Returns: (positive_prompt, negative_prompt)
-    """
-    if "LTX2PromptArchitect" not in NODE_CLASS_MAPPINGS:
-        print("   ⚠️  LTX2PromptArchitect not found — using raw user_input.")
-        return user_input, ""
-
-    _model = llm_model_override if llm_model_override is not None else LLM_MODEL
-    print(f"   [EasyPrompt] LLM={_model} | creativity={CREATIVITY} | frames={frame_count}")
-    node = NODE_CLASS_MAPPINGS["LTX2PromptArchitect"]()
-    result = node.generate(
-        bypass=False,
-        user_input=user_input,
-        creativity=_creativity_label(CREATIVITY),
-        seed=seed,
-        invent_dialogue=INVENT_DIALOGUE,
-        keep_model_loaded=False,
-        offline_mode=False,
-        frame_count=frame_count,
-        model=_LLM_LABEL_MAP.get(_model, "8B - NeuralDaredevil (High Quality)"),
-        local_path_8b="",
-        local_path_3b="",
-        local_path_14b="",
-        scene_context=scene_context,
-        lora_triggers=LORA_TRIGGERS,
+    PROMPT = (
+        "Describe this image in one paragraph of plain sentences, 100-130 words. "
+        "Start with 'Style: photorealistic' or 'Style: anime' or 'Style: 3D animation' etc. "
+        "The FIRST sentence about any person MUST explicitly state ethnicity and skin tone "
+        "using plain terms: 'a Black man', 'a white woman', 'a South Asian man'. "
+        "Include age, hair colour and style, body type, clothing or nude state, pose, "
+        "camera framing, angle, lighting, time of day, and setting. "
+        "One flowing paragraph, no bullets, no labels. "
+        "If no person, describe environment, objects, lighting, mood."
     )
-    prompt     = result[0]  # PROMPT output
-    neg_prompt = result[2]  # NEG_PROMPT output
-    print(f"   [EasyPrompt] ✓  {len(prompt.split())} words generated.")
-    cleanup_memory()
-    return prompt, neg_prompt
 
+    def __init__(self, model_key: str = "3B-fast", offline: bool = False):
+        self.model_key = model_key
+        self.offline = offline
 
-def run_vision_describe(image_tensor: torch.Tensor,
-                        character_desc: str = "",
-                        use_vision_override: bool = None,
-                        vision_model_override: str = None) -> str:
-    """
-    Calls LTX2VisionDescribe (node type: LTX2VisionDescribe from LTX2EasyPrompt-LD)
-    to analyse the image and return a scene description for use as scene_context.
-    character_desc is prepended to seed the analysis toward the character.
+    def describe(self, image: Union[Image.Image, torch.Tensor]) -> str:
+        from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
+        from huggingface_hub import snapshot_download
+        try:
+            from qwen_vl_utils import process_vision_info
+        except ImportError:
+            raise ImportError("[VisionDescribe] pip install qwen-vl-utils")
 
-    use_vision_override: when provided, overrides the USE_VISION global for this call.
-    vision_model_override: when provided, overrides the VISION_MODEL global for this call.
-    Returns: scene_context string (empty string on failure).
-    """
-    _use_v   = use_vision_override   if use_vision_override   is not None else USE_VISION
-    _vis_mod = vision_model_override if vision_model_override is not None else VISION_MODEL
+        if isinstance(image, torch.Tensor):
+            image = tensor_to_pil(image)
 
-    if not _use_v:
-        return character_desc
-    if "LTX2VisionDescribe" not in NODE_CLASS_MAPPINGS:
-        print("   ⚠️  LTX2VisionDescribe not found — skipping vision analysis.")
-        return character_desc
+        hf_id = self.MODEL_OPTIONS[self.model_key]
+        if not self.offline:
+            os.environ.pop("TRANSFORMERS_OFFLINE", None)
+            try:
+                source = snapshot_download(hf_id)
+            except Exception:
+                source = hf_id
+        else:
+            os.environ["TRANSFORMERS_OFFLINE"] = "1"
+            source = hf_id
 
-    print(f"   [VisionDescribe] model={_vis_mod} | image shape={image_tensor.shape}")
-    node = NODE_CLASS_MAPPINGS["LTX2VisionDescribe"]()
-    result = node.describe(
-        image=image_tensor,
-        model_name=_VISION_LABEL_MAP.get(_vis_mod, "Qwen2.5-VL-3B — Fast (huihui abliterated)"),
-        offline_mode=False,
-        local_path="",
-    )
-    ctx = result[0]
-    if character_desc:
-        ctx = character_desc + " " + ctx
-    print(f"   [VisionDescribe] ✓  {len(ctx.split())} words.")
-    cleanup_memory()
-    return ctx
+        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        print(f"   [VisionDescribe] Loading {self.model_key} ({image.size}) ...")
+        processor = AutoProcessor.from_pretrained(source, local_files_only=self.offline)
+        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            source, device_map="auto", torch_dtype=dtype,
+            local_files_only=self.offline)
+        model.eval()
 
+        messages = [
+            {"role": "system", "content":
+             "You are an image analysis tool. Describe exactly what you see in plain prose."},
+            {"role": "user", "content": [
+                {"type": "image", "image": image},
+                {"type": "text", "text": self.PROMPT},
+            ]},
+        ]
+        text_in = processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True)
+        img_in, vid_in = process_vision_info(messages)
+        inputs = processor(text=[text_in], images=img_in, videos=vid_in,
+                           padding=True, return_tensors="pt").to(model.device)
+        input_len = inputs["input_ids"].shape[1]
 
-print("✅ Imports & helpers ready.")
-print("   Helper functions defined:")
-print("   ✓ cleanup_memory()       — with ipc_collect()")
-print("   ✓ apply_sage_attention() — PathchSageAttentionKJ wrapper")
-print("   ✓ apply_chunk_ff()       — LTXVChunkFeedForward wrapper")
-print("   ✓ purge_vram()           — LayerUtility: PurgeVRAM V2 wrapper")
-print("   ✓ apply_lora_stack()     — LTX2MasterLoaderLD + manual fallback")
-print("   ✓ run_easy_prompt()      — LTX2PromptArchitect wrapper")
-print("   ✓ run_vision_describe()  — LTX2VisionDescribe wrapper")
-print("   ✓ save_metadata_sidecar() — JSON sidecar writer")
+        tok = processor.tokenizer
+        stop_ids = [i for i in [tok.eos_token_id] if i is not None]
+        for s in ["<|im_end|>", "<|endoftext|>"]:
+            ids = tok.encode(s, add_special_tokens=False)
+            if len(ids) == 1 and ids[0] not in stop_ids:
+                stop_ids.append(ids[0])
+
+        with torch.no_grad():
+            out = model.generate(**inputs, max_new_tokens=210, temperature=0.3,
+                                 do_sample=True, top_p=0.9,
+                                 pad_token_id=tok.pad_token_id or tok.eos_token_id,
+                                 eos_token_id=stop_ids)
+        desc = tok.decode(out[0][input_len:], skip_special_tokens=True).strip()
+        del out, inputs, model, processor
+        cleanup_memory()
+        print(f"   [VisionDescribe] Done. {len(desc.split())} words.")
+        return desc
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CELL 4  ─  EASY PROMPT + VISION SETTINGS
+# EASY PROMPT ENGINE
+# Full cinematic LLM expansion with pacing, bible lock, dialogue control.
+# ══════════════════════════════════════════════════════════════════════════════
+
+_NEG_BASE = (
+    "blurry, out of focus, low quality, worst quality, jpeg artifacts, "
+    "static, no motion, frozen, duplicate, watermark, text, signature, "
+    "poorly drawn, bad anatomy, deformed, disfigured, extra limbs, "
+    "missing limbs, overexposed, underexposed, grainy, noise, flickering"
+)
+
+
+def _build_neg(result: str, user_input: str) -> str:
+    c = (result + " " + user_input).lower()
+    extras = []
+    if any(w in c for w in ["indoor", "room", "interior", "bedroom", "kitchen", "office"]):
+        extras.append("harsh outdoor lighting, direct sunlight")
+    elif any(w in c for w in ["outdoor", "street", "beach", "forest", "park"]):
+        extras.append("studio background, indoor lighting")
+    if any(w in c for w in ["close-up", "close up", "portrait", "headshot"]):
+        extras.append("wide angle distortion, fish eye")
+    elif any(w in c for w in ["wide shot", "wide angle", "aerial"]):
+        extras.append("close-up, portrait crop")
+    if any(w in c for w in ["night", "dark", "moonlight", "dimly lit", "candlelight"]):
+        extras.append("overexposed, bright daylight, blown highlights")
+    elif any(w in c for w in ["daylight", "sunny", "golden hour", "bright"]):
+        extras.append("underexposed, dark shadows, black crush")
+    if any(w in c for w in ["two women", "two men", "two people", "couple", "both"]):
+        extras.append("merged bodies, fused figures, incorrect number of people")
+    return ", ".join([_NEG_BASE] + extras)
+
+
+class EasyPromptEngine:
+    """
+    Expands a simple story beat into a dense cinematic LTX-2 prompt.
+    Loads the LLM, generates, cleans output, then unloads to free VRAM.
+    """
+
+    MODELS = {
+        "8B":  "mlabonne/NeuralDaredevil-8B-abliterated",
+        "3B":  "huihui-ai/Llama-3.2-3B-Instruct-abliterated",
+        "14B": "huihui-ai/Huihui-Qwen3-14B-abliterated-v2",
+    }
+
+    SYSTEM_PROMPT = """You are a cinematic prompt writer for LTX-2, an AI video generation model. Expand the user's idea into a rich, video-ready prompt.
+
+PRIORITY ORDER:
+1. Video style & genre (slow-burn thriller, documentary, editorial, action blockbuster)
+2. Camera angle & shot type (low-angle close-up, bird's-eye wide, Dutch angle medium)
+3. Character description - age MUST be a specific number (e.g. "a 28-year-old woman"), body type, hair, skin, clothing. Use exact words from the user.
+4. Scene & environment (location, time of day, lighting, colour palette, atmosphere)
+5. Action & motion - continuous present-tense sequence.
+6. Camera movement - prose only, no screenplay brackets like (HOLD) or (DOWN 10).
+7. Audio - max 2 ambient sounds active at once, woven as prose. Dialogue as inline prose with attribution, never as [DIALOGUE:] tags.
+
+RULES:
+- Present tense throughout.
+- 8-12 sentences of dense flowing prose - no bullet lists.
+- Fill the full token budget. Do not stop early.
+- Output ONLY the expanded prompt. No preamble. No trailing notes. No commentary."""
+
+    _CLEAN_RE = [
+        (re.compile(r"<think>.*?</think>", re.DOTALL), ""),
+        (re.compile(r"^(Sure!?|Certainly!?|Here(?:'s| is).*?:)[^\n]*\n?", re.IGNORECASE), ""),
+        (re.compile(r"\s*(assistant|user|system|<\|[^|>]*\|>)\s*$", re.IGNORECASE), ""),
+        (re.compile(r"\s*\n+Note:.*$", re.DOTALL), ""),
+        (re.compile(r"\s*\(Note:.*$", re.DOTALL | re.IGNORECASE), ""),
+        (re.compile(r"\s*(\([^)]{5,120}\)\s*){2,}$", re.DOTALL), ""),
+        (re.compile(r"\s*\n+(Please let me know|Let me revise|Confirmed\.|Output ends|"
+                    r"Done\.|I hope|Thank you|No further).*$",
+                    re.DOTALL | re.IGNORECASE), ""),
+        (re.compile(r"\n{3,}"), "\n\n"),
+    ]
+
+    def __init__(self, model_size: str = "8B", offline: bool = False,
+                 keep_loaded: bool = False):
+        self.model_size = model_size
+        self.offline = offline
+        self.keep_loaded = keep_loaded
+        self._tok = None
+        self._model = None
+        self._loaded_key = None
+
+    def _load(self):
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from huggingface_hub import snapshot_download
+        key = self.model_size
+        if self._model is not None and self._loaded_key == key:
+            return
+        if self._model is not None:
+            self._unload()
+        hf_id = self.MODELS[key]
+        if not self.offline:
+            os.environ.pop("TRANSFORMERS_OFFLINE", None)
+            try:
+                source = snapshot_download(hf_id)
+            except Exception:
+                source = hf_id
+        else:
+            os.environ["TRANSFORMERS_OFFLINE"] = "1"
+            source = hf_id
+        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        print(f"   [EasyPrompt] Loading {key} ...")
+        self._tok = AutoTokenizer.from_pretrained(source, local_files_only=self.offline)
+        self._model = AutoModelForCausalLM.from_pretrained(
+            source, device_map="auto", torch_dtype=dtype,
+            trust_remote_code=True, local_files_only=self.offline)
+        self._model.config.use_cache = True
+        self._model.eval()
+        self._loaded_key = key
+        print(f"   [EasyPrompt] Loaded.")
+
+    def _unload(self):
+        if self._model is not None:
+            try:
+                self._model.to("cpu")
+            except Exception:
+                pass
+        self._model = None
+        self._tok = None
+        self._loaded_key = None
+        cleanup_memory()
+        print("   [EasyPrompt] VRAM cleared.")
+
+    def _stop_ids(self) -> List[int]:
+        delims = ["assistant", "user", "system", "<|eot_id|>", "<|end_of_turn|>",
+                  "<|im_end|>", "<end_of_turn>", "[/INST]", "### Human", "### Assistant"]
+        ids = [self._tok.eos_token_id]
+        for s in delims:
+            enc = self._tok.encode(s, add_special_tokens=False)
+            if enc and enc[0] not in ids:
+                ids.append(enc[0])
+        return [i for i in dict.fromkeys(ids) if i is not None]
+
+    @staticmethod
+    def _clean(text: str) -> str:
+        text = text.strip()
+        for pattern, repl in EasyPromptEngine._CLEAN_RE:
+            text = pattern.sub(repl, text)
+        text = re.sub(r"\s*[\(\[]\s*$", "", text)
+        return text.strip()
+
+    def generate(
+        self,
+        user_input: str,
+        frame_count: int = 121,
+        creativity: float = 0.9,
+        seed: int = -1,
+        scene_context: str = "",
+        lora_triggers: str = "",
+        character_bible: str = "",
+    ) -> tuple:
+        """
+        Returns (positive_prompt, negative_prompt).
+
+        character_bible - injected as a hard [CHARACTER BIBLE - NON-NEGOTIABLE]
+        block so the LLM cannot alter hair, age, clothing, or any locked attribute.
+        """
+        self._load()
+
+        real_seconds = frame_count / 25.0
+        action_count = max(1, min(10, round(real_seconds / 4)))
+        token_budget = max(256, min(1200, action_count * 120))
+        max_tokens = int(token_budget * 1.05)
+        min_tokens = int(token_budget * 0.75)
+
+        if seed != -1:
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed)
+
+        ordinal = {2: "2nd", 3: "3rd"}.get(action_count, f"{action_count}th")
+        pacing = (
+            f"This clip is {real_seconds:.0f}s. Write EXACTLY {action_count} "
+            f"distinct action{'s' if action_count > 1 else ''}. "
+            f"HARD STOP after the {ordinal} action. "
+            f"Write ~{token_budget} tokens."
+        ) if action_count > 1 else (
+            f"This clip is {real_seconds:.0f}s. Write EXACTLY 1 action. "
+            f"HARD STOP after it. ~{token_budget} tokens."
+        )
+
+        bible_clause = ""
+        if character_bible.strip():
+            bible_clause = (
+                f"\n[CHARACTER BIBLE - NON-NEGOTIABLE: Every character attribute below "
+                f"MUST remain exactly as described. Do NOT alter hair, age, skin, "
+                f"clothing, or any other attribute. This overrides any inference:\n"
+                f"{character_bible.strip()}\n]"
+            )
+
+        if scene_context.strip():
+            effective = (
+                f"[SCENE CONTEXT FROM IMAGE - authoritative, do not contradict]\n"
+                f"{scene_context.strip()}\n\n"
+                f"[USER DIRECTION - action, style, mood]\n{user_input.strip()}"
+            )
+        else:
+            effective = user_input.strip()
+
+        lora_clause = (f"\n[LORA: Begin prompt with: {lora_triggers.strip()}]"
+                       if lora_triggers.strip() else "")
+
+        user_content = (effective + bible_clause + lora_clause
+                        + f"\n[PACING: {pacing}]")
+
+        messages = [
+            {"role": "system", "content": self.SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
+        ]
+
+        is_qwen3 = "Qwen3" in self.MODELS.get(self.model_size, "")
+        raw = self._tok.apply_chat_template(
+            messages, return_tensors="pt", add_generation_prompt=True,
+            **({"enable_thinking": False} if is_qwen3 else {}))
+
+        if hasattr(raw, "input_ids"):
+            input_ids = raw.input_ids.to(self._model.device)
+        elif isinstance(raw, dict):
+            input_ids = raw["input_ids"].to(self._model.device)
+        elif isinstance(raw, list):
+            input_ids = torch.tensor([raw], dtype=torch.long).to(self._model.device)
+        else:
+            input_ids = raw.to(self._model.device)
+
+        input_len = input_ids.shape[1]
+
+        with torch.no_grad():
+            out = self._model.generate(
+                input_ids, min_new_tokens=min_tokens, max_new_tokens=max_tokens,
+                temperature=creativity, do_sample=True, top_k=40, top_p=0.9,
+                repetition_penalty=1.07, use_cache=True,
+                pad_token_id=self._tok.eos_token_id,
+                eos_token_id=self._stop_ids())
+
+        result = self._tok.decode(out[0][input_len:], skip_special_tokens=True).strip()
+        result = self._clean(result)
+        result = re.sub(r'\s*[\(\[]\s*$', '', result).strip()
+        del out, input_ids
+        neg = _build_neg(result, user_input)
+
+        if not self.keep_loaded:
+            self._unload()
+
+        print(f"   [EasyPrompt] Done. {len(result.split())} words generated.")
+        return result, neg
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CHARACTER BIBLE
+# Serialisable cross-scene character consistency record.
+# ══════════════════════════════════════════════════════════════════════════════
+
+class CharacterBible:
+    """
+    Records named character attributes and serialises them as a prompt-injection
+    block. The block is passed to EasyPromptEngine as character_bible so the
+    LLM receives a hard [NON-NEGOTIABLE] constraint preventing attribute drift.
+
+    Auto-populated from Vision Describe output on the seed image (recommended),
+    or filled manually with add().
+    """
+
+    def __init__(self):
+        self._chars: dict = {}
+
+    def add(self, name: str, **attributes):
+        """Manually define a character."""
+        self._chars[name] = dict(attributes)
+
+    def extract_from_description(self, name: str, description: str):
+        """Store a raw Vision Describe output under a character name."""
+        self._chars[name] = {"_raw": description.strip()}
+
+    def to_prompt_block(self) -> str:
+        """Returns the injection string for EasyPromptEngine."""
+        if not self._chars:
+            return ""
+        lines = []
+        for name, attrs in self._chars.items():
+            if "_raw" in attrs:
+                lines.append(f"CHARACTER - {name}:\n{attrs['_raw']}")
+            else:
+                attr_str = "; ".join(f"{k}: {v}" for k, v in attrs.items())
+                lines.append(f"CHARACTER - {name}: {attr_str}")
+        return "\n\n".join(lines)
+
+    def has_characters(self) -> bool:
+        return bool(self._chars)
+
+    def names(self) -> List[str]:
+        return list(self._chars.keys())
+
+    def save(self, path: str):
+        with open(path, "w") as f:
+            json.dump(self._chars, f, indent=2)
+        print(f"   [Bible] Saved -> {path}")
+
+    def load(self, path: str):
+        with open(path) as f:
+            self._chars = json.load(f)
+        print(f"   [Bible] Loaded from {path}")
+
+    def __repr__(self):
+        return f"CharacterBible({self.names()})"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PRO FEATURES - Camera LoRA Mapping, Motion Guidance, Adaptive Strength
+# ══════════════════════════════════════════════════════════════════════════════
+
+CAMERA_LORA_MAPPING = {
+    "dolly_forward": "ltx-2-19b-lora-camera-control-dolly-in.safetensors",
+    "dolly_backward": "ltx-2-19b-lora-camera-control-dolly-out.safetensors",
+    "dolly_in": "ltx-2-19b-lora-camera-control-dolly-in.safetensors",
+    "dolly_out": "ltx-2-19b-lora-camera-control-dolly-out.safetensors",
+    "dolly_left": "ltx-2-19b-lora-camera-control-dolly-left.safetensors",
+    "dolly_right": "ltx-2-19b-lora-camera-control-dolly-right.safetensors",
+    "pan_left": "ltx-2-19b-lora-camera-control-dolly-left.safetensors",
+    "pan_right": "ltx-2-19b-lora-camera-control-dolly-right.safetensors",
+    "tilt_up": "ltx-2-19b-lora-camera-control-jib-up.safetensors",
+    "tilt_down": "ltx-2-19b-lora-camera-control-jib-down.safetensors",
+    "jib_up": "ltx-2-19b-lora-camera-control-jib-up.safetensors",
+    "jib_down": "ltx-2-19b-lora-camera-control-jib-down.safetensors",
+    "zoom_in": "ltx-2-19b-lora-camera-control-dolly-in.safetensors",
+    "zoom_out": "ltx-2-19b-lora-camera-control-dolly-out.safetensors",
+    "static": "ltx-2-19b-lora-camera-control-static.safetensors",
+}
+
+
+def build_character_prompt_detailed(character_data):
+    """Build highly detailed character description for consistency."""
+    char_name = character_data["name"]
+    appearance = character_data.get("detailed_appearance", {})
+    if not appearance:
+        return f"{char_name}: {character_data.get('desc', '')}"
+    prompt = f"{char_name}: "
+    prompt += f"{appearance.get('face', '')}, "
+    prompt += f"{appearance.get('hair', '')}, "
+    prompt += f"wearing {appearance.get('clothing', '')}, "
+    prompt += f"{appearance.get('build', '')}, {appearance.get('skin_tone', '')}, "
+    prompt += f"{appearance.get('accessories', '')}. "
+    prompt += (f"ALWAYS MAINTAIN: {char_name} has "
+               f"{appearance.get('face', '').split(',')[0]}, "
+               f"{appearance.get('hair', '').split(',')[0]}, "
+               f"{appearance.get('clothing', '').split(',')[0]}. ")
+    return prompt
+
+
+def get_character_consistency_prefix(scene_json):
+    """Generate character consistency prefix for ALL prompts."""
+    char_prompts = []
+    for char in scene_json.get("main_characters", []):
+        char_prompt = build_character_prompt_detailed(char)
+        char_prompts.append(char_prompt)
+    if not char_prompts:
+        return ""
+    consistency_prompt = "CHARACTER CONSISTENCY CRITICAL: " + " | ".join(char_prompts)
+    consistency_prompt += " | MAINTAIN EXACT SAME CHARACTER APPEARANCE THROUGHOUT."
+    return consistency_prompt
+
+
+def get_motion_guidance_prompt(shot):
+    """Build motion-specific guidance prompt."""
+    motion_intensity = shot.get("motion_intensity", 0.5)
+    camera_movement = shot.get("camera_movement", "static")
+    if motion_intensity < 0.3:
+        motion_desc = "minimal motion, subtle movements, mostly static"
+    elif motion_intensity < 0.6:
+        motion_desc = "moderate motion, natural movements, steady pace"
+    else:
+        motion_desc = "dynamic motion, pronounced movements, energetic action"
+    camera_desc = camera_movement.replace("_", " ")
+    prompt = f"MOTION GUIDANCE: {motion_desc}. CAMERA: {camera_desc}. "
+    if motion_intensity > 0.6:
+        prompt += "Fast-paced action, clear motion trails. "
+    else:
+        prompt += "Smooth controlled movement, clean frames. "
+    return prompt
+
+
+def get_camera_lora_for_shot(shot):
+    """Determine which camera LoRA to use for this shot."""
+    camera_movement = shot.get("camera_movement", "static")
+    for key in CAMERA_LORA_MAPPING.keys():
+        if key in camera_movement:
+            return key, CAMERA_LORA_MAPPING[key]
+    return None, None
+
+
+def get_dialogue_for_shot_enhanced(start_time, end_time, dialogue_list):
+    """Enhanced dialogue injection with voice sync guidance."""
+    lines = []
+    for entry in dialogue_list:
+        if start_time <= entry.get("time", 0) < end_time:
+            char = entry.get("character", "")
+            text = entry.get("dialogue", "")
+            emotion = entry.get("emotion", "neutral")
+            voice_direction = entry.get("voice_direction", "")
+            lip_sync = entry.get("lip_sync_emphasis", "medium")
+            if char == "The Cave":
+                lines.append(f"AUDIO EFFECT: Eerie whisper '{text}' with hollow reverb")
+            else:
+                if lip_sync == "high":
+                    lines.append(
+                        f"LIP SYNC CRITICAL: {char} speaks '{text}' with {emotion} emotion. "
+                        f"{voice_direction}. Mouth movements MUST match dialogue.")
+                else:
+                    lines.append(f"{char} says '{text}' with {emotion} emotion. {voice_direction}.")
+    return " | ".join(lines) if lines else ""
+
+
+def build_audio_atmosphere_prompt(shot, scene_json, start_s, end_s):
+    """Build comprehensive audio prompt including dialogue and SFX."""
+    audio_config = scene_json.get("audio", {})
+    atmosphere = f"AUDIO ATMOSPHERE: {audio_config.get('background_music', '')}. "
+    atmosphere += f"SOUND EFFECTS: {audio_config.get('environment_sfx', '')}. "
+    atmosphere += f"VOICE: {audio_config.get('voice_processing', '')}. "
+    dialogue_text = get_dialogue_for_shot_enhanced(
+        start_s, end_s, scene_json.get("dialogue_with_timing", []))
+    if dialogue_text:
+        atmosphere += dialogue_text
+    return atmosphere
+
+
+def build_shot_prompt_pro(shot, json_data, shot_index, prev_shot_success=True):
+    """
+    PRO version of prompt builder with character consistency enforcement,
+    motion guidance, voice sync, and adaptive strength.
+    """
+    try:
+        times = shot["time"].replace("s", "").split("-")
+        start_s = int(times[0])
+        end_s = int(times[1])
+    except Exception:
+        start_s, end_s = 0, 5
+
+    character_prompt = get_character_consistency_prefix(json_data)
+    action_prompt = f"SHOT {shot_index + 1}: {shot.get('action', '')}. "
+    camera_prompt = f"CAMERA: {shot.get('camera', '')}. "
+    motion_prompt = get_motion_guidance_prompt(shot)
+
+    env = json_data.get("environment", {})
+    env_prompt = (f"ENVIRONMENT: {env.get('location', '')}. "
+                  f"LIGHTING: {env.get('lighting', '')}. "
+                  f"TIME: {env.get('time', '')}. "
+                  f"WEATHER: {env.get('weather', '')}. "
+                  f"MOOD: {env.get('mood', '')}. "
+                  f"COLOR PALETTE: {env.get('color_palette', '')}. ")
+
+    style_prompt = f"STYLE: {json_data.get('video_style', '')}. "
+    audio_prompt = build_audio_atmosphere_prompt(shot, json_data, start_s, end_s)
+    vfx_prompt = f"VISUAL EFFECTS: {shot.get('visual_effects', 'natural')}. "
+    emotion_prompt = (f"EMOTION: {shot.get('emotion', 'neutral')}. "
+                      f"FOCUS: {shot.get('character_focus', 'scene')}. ")
+
+    final_prompt = (
+        character_prompt + " " +
+        action_prompt +
+        camera_prompt +
+        motion_prompt +
+        emotion_prompt +
+        env_prompt +
+        vfx_prompt +
+        style_prompt +
+        audio_prompt
+    )
+    return final_prompt
+
+
+def calculate_adaptive_strength(shot, prev_shot, prev_shot_success,
+                                anchor_high=0.85, anchor_low=0.70):
+    """
+    Calculate anchor strength based on motion intensity change,
+    character focus change, and previous shot success rate.
+    """
+    strength = anchor_high
+
+    if prev_shot:
+        motion_change = abs(
+            shot.get("motion_intensity", 0.5) -
+            prev_shot.get("motion_intensity", 0.5)
+        )
+        if motion_change > 0.4:
+            strength -= 0.10
+        elif motion_change < 0.2:
+            strength += 0.05
+
+    if prev_shot:
+        if shot.get("character_focus") != prev_shot.get("character_focus"):
+            strength -= 0.05
+
+    if not prev_shot_success:
+        strength -= 0.10
+
+    strength = max(anchor_low, min(anchor_high, strength))
+    return strength
+
+
+def build_negative_prompt_enhanced(base_neg=None):
+    """Build comprehensive negative prompt."""
+    if base_neg is None:
+        base_neg = _NEG_BASE
+    char_neg = ("character morphing, face changing, inconsistent character design, "
+                "different clothing in same scene, style shift, ")
+    motion_neg = ("motion blur artifacts, jittery movement, unnatural animation, "
+                  "robotic motion, floating characters, ")
+    audio_neg = ("desynchronized lips, mouth not moving during speech, "
+                 "frozen face during dialogue, mismatched audio, ")
+    quality_neg = ("compression artifacts, pixelation, banding, color shifts, "
+                   "lighting inconsistency, flickering, ")
+    return char_neg + motion_neg + audio_neg + quality_neg + base_neg
+
+
+print("Imports & engine classes ready.")
+print("   VisionDescribeEngine, EasyPromptEngine, CharacterBible")
+print("   PRO: CAMERA_LORA_MAPPING, build_shot_prompt_pro, calculate_adaptive_strength")
+print("   PRO: build_negative_prompt_enhanced, get_motion_guidance_prompt")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CELL 4  ─  CONFIGURATION
 # ══════════════════════════════════════════════════════════════════════════════
 
 # @title  { "single-column": true }
-# @markdown ## 💥 4. Easy Prompt & Vision Describe Configuration
-# @markdown Set `BYPASS_EASY_PROMPT = True` to skip the LLM and write
-# @markdown `POSITIVE_PROMPT` manually in Cell 6.
+# @markdown ## 4. EasyPrompt & Vision Configuration
 
-# ── LLM prompt expander (LTX2PromptArchitect node) ───────────────────────────
-LLM_MODEL  = "8B"    # @param ["8B", "3B", "14B"]
-# "8B"  → NeuralDaredevil-8B-abliterated  — best quality, ~10 GB VRAM
-# "3B"  → Llama-3.2-3B-abliterated       — fastest, ~4 GB (T4 safe)
-# "14B" → Qwen3-14B-abliterated           — highest quality, ~18 GB VRAM
-
-CREATIVITY = 0.9     # @param {type:"number"}
-# 0.7 = Literal & Grounded  |  0.9 = Balanced  |  1.1 = Artistic
-
-INVENT_DIALOGUE    = True   # @param {type:"boolean"}
-# When True the LLM invents natural spoken dialogue woven into the scene.
-
+# ── LLM prompt expander ───────────────────────────────────────────────────────
+LLM_MODEL = "8B"  # @param ["8B", "3B", "14B"]
+CREATIVITY = 0.9  # @param {type:"number"}
+INVENT_DIALOGUE = True  # @param {type:"boolean"}
 BYPASS_EASY_PROMPT = False  # @param {type:"boolean"}
-# True  → skip LLM, use POSITIVE_PROMPT directly (fast/manual control)
-# False → LLM expands USER_INPUT into a full cinematic prompt
+LORA_TRIGGERS = ""  # @param {type:"string"}
 
-LORA_TRIGGERS = ""          # @param {type:"string"}
-# LoRA trigger words injected at the start of every expanded prompt.
-# e.g. "ohwx woman" or "film grain, 35mm"
-
-# ── Vision image describer (LTX2VisionDescribe node) ─────────────────────────
-USE_VISION   = True          # @param {type:"boolean"}
-# When True AND an image is provided, Vision Describe analyses it and passes
-# the result as scene_context to Easy Prompt. Adds ~30-90s on first run.
-
-VISION_MODEL = "3B-fast"     # @param ["3B-fast", "7B-nsfw"]
-# "3B-fast" → Qwen2.5-VL-3B — faster, ~5 GB VRAM
-# "7B-nsfw" → Qwen2.5-VL-7B — more accurate, ~10 GB VRAM
+# ── Vision image describer ────────────────────────────────────────────────────
+USE_VISION = True  # @param {type:"boolean"}
+VISION_MODEL = "3B-fast"  # @param ["3B-fast", "7B-nsfw"]
 
 # ── Display & output ──────────────────────────────────────────────────────────
-SHOW_PREVIEWS           = True   # @param {type:"boolean"}
-# Display each video inline after generation.
-
+SHOW_PREVIEWS = True  # @param {type:"boolean"}
 DOWNLOAD_AFTER_GENERATE = False  # @param {type:"boolean"}
-# Auto-call files.download(output) after each generation.
-# Useful for immediately saving clips to your local machine.
 
-print("✅ Easy Prompt + Vision settings ready.")
-print(f"   LLM: {LLM_MODEL}  |  Vision: {VISION_MODEL}  |  "
-      f"Creativity: {CREATIVITY}  |  Bypass: {BYPASS_EASY_PROMPT}")
-print(f"   Show previews: {SHOW_PREVIEWS}  |  Auto-download: {DOWNLOAD_AFTER_GENERATE}")
+# ── PRO settings ──────────────────────────────────────────────────────────────
+USE_CHARACTER_LORAS = True  # @param {type:"boolean"}
+USE_MOTION_LORAS = True  # @param {type:"boolean"}
+USE_VOICE_SYNC = True  # @param {type:"boolean"}
+USE_ADAPTIVE_STRENGTH = True  # @param {type:"boolean"}
+ANCHOR_STRENGTH_HIGH = 0.85  # @param {type:"number"}
+ANCHOR_STRENGTH_LOW = 0.70  # @param {type:"number"}
+USE_NEGATIVE_PROMPT_EXPANSION = True  # @param {type:"boolean"}
+USE_PROMPT_WEIGHTING = True  # @param {type:"boolean"}
+INJECT_CHARACTER_EVERY_SHOT = True  # @param {type:"boolean"}
+
+# ── Example SCENE_JSON schema (edit for your project) ─────────────────────────
+SCENE_JSON = {
+    "scene_id": "scene_01_example",
+    "project_name": "MyProject_PRO",
+    "duration_seconds": 24,
+    "video_style": "cinematic, professional quality, consistent character design",
+    "environment": {
+        "location": "Urban city street at night",
+        "time": "Late evening, artificial lighting",
+        "weather": "Light rain, wet surfaces",
+        "mood": "Mysterious, atmospheric",
+        "lighting": "Neon reflections, volumetric haze",
+        "color_palette": "Deep blues, warm amber highlights, purple neon"
+    },
+    "main_characters": [
+        {
+            "name": "Character",
+            "desc": "Main character",
+            "detailed_appearance": {
+                "face": "Defined features, expressive eyes",
+                "hair": "Dark hair, natural style",
+                "clothing": "Dark jacket, casual wear",
+                "build": "Average build",
+                "skin_tone": "Natural skin tone",
+                "accessories": "None"
+            },
+            "lora_path": None,
+            "personality_traits": "Determined, cautious",
+            "voice_characteristics": "Clear voice"
+        }
+    ],
+    "story_action": {
+        "shots": [
+            {
+                "time": "0-4s",
+                "camera": "Wide establishing shot",
+                "camera_movement": "static",
+                "motion_intensity": 0.3,
+                "action": "Character walks through the rain-soaked street",
+                "character_focus": "main",
+                "emotion": "determined",
+                "visual_effects": "Rain drops, neon reflections"
+            },
+            {
+                "time": "4-8s",
+                "camera": "Medium tracking shot",
+                "camera_movement": "dolly_forward",
+                "motion_intensity": 0.5,
+                "action": "Character looks over shoulder, speeds up pace",
+                "character_focus": "main",
+                "emotion": "alert",
+                "visual_effects": "Motion blur background, focused subject"
+            }
+        ]
+    },
+    "dialogue_with_timing": [],
+    "audio": {
+        "background_music": "Low atmospheric ambient",
+        "environment_sfx": "Rain, distant traffic, footsteps",
+        "voice_processing": "Natural reverb"
+    }
+}
+
+print("Configuration ready.")
+print(f"   LLM: {LLM_MODEL} | Vision: {VISION_MODEL} | Creativity: {CREATIVITY}")
+print(f"   PRO: Characters={USE_CHARACTER_LORAS} Motion={USE_MOTION_LORAS} Voice={USE_VOICE_SYNC}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CELL 5  ─  CHARACTER CONSISTENCY & LORA CONFIGURATION
+# CELL 5  ─  CHARACTER & LORA CONFIGURATION
 # ══════════════════════════════════════════════════════════════════════════════
 
 # @title  { "single-column": true }
-# @markdown ## 💥 5. Character Consistency & LoRA Configuration
-# @markdown Configure character reference, IC LoRA, camera LoRA, and
-# @markdown performance settings.  These apply to every call of `generate_pro()`.
+# @markdown ## 5. Character & LoRA Configuration
 
-# ── Character Consistency System ─────────────────────────────────────────────
+# ── Character Consistency ─────────────────────────────────────────────────────
 CHARACTER_IMAGE_PATH = None  # @param {type:"string"}
-# Path to a reference character image.
-# e.g. "/content/ComfyUI/input/my_character.jpg"
-# Leave None for no character reference.
-
-CHARACTER_STRENGTH = 1.0     # @param {type:"number"}
-# 0.0-1.0 — how strongly to enforce character appearance.
-# 1.0 = maximum fidelity to reference.  0.5 = balanced.
-
+CHARACTER_STRENGTH = 1.0  # @param {type:"number"}
 CHARACTER_CONSISTENCY_MODE = "i2v"  # @param ["i2v", "anchor", "both", "none"]
-# "i2v"    → LTXVImgToVideoInplace — injects character image directly into
-#            the video latent as the first frame (strong, natural motion).
-# "anchor" → VAEEncode → anchor_samples SetNode — encodes character image
-#            as latent and injects it before Pass 1 as a constraint.
-# "both"   → applies both i2v AND anchor methods for maximum consistency.
-# "none"   → no character conditioning applied.
-
 CHARACTER_NAME = "Character"  # @param {type:"string"}
-# Label used in output filename for tracking (e.g. "ElenaRossi").
+CHARACTER_DESCRIPTION = ""  # @param {type:"string"}
 
-CHARACTER_DESCRIPTION = ""   # @param {type:"string"}
-# Brief description fed to VisionDescribe as scene_context seed.
-# e.g. "tall woman with auburn hair, wearing a red coat, early 30s"
+# ── IC LoRA (Image Conditioning / Detailer) ───────────────────────────────────
+IC_LORA = "detailer"  # @param ["none", "detailer", "canny", "depth", "pose"]
+IC_LORA_STRENGTH = 0.4  # @param {type:"number"}
 
-# ── IC LoRA slot 1 (Image Conditioning / Detailer) ────────────────────────────
-IC_LORA          = "detailer"  # @param ["none", "detailer", "canny", "depth", "pose"]
-IC_LORA_STRENGTH = 0.4         # @param {type:"number"}
-# "detailer" — general IC detailer LoRA (recommended default)
-# "canny"    — edge-guided control
-# "depth"    — depth-map guided control
-# "pose"     — pose-guided control
+_IC_LORA_FILES = {
+    "none": "None",
+    "detailer": "ltx-2-19b-ic-lora-detailer.safetensors",
+    "canny": "ltx-2-19b-ic-lora-canny-control.safetensors",
+    "depth": "ltx-2-19b-ic-lora-depth-control.safetensors",
+    "pose": "ltx-2-19b-ic-lora-pose-control.safetensors",
+}
 
-# ── Camera LoRA slot 2 ────────────────────────────────────────────────────────
-CAMERA_LORA          = "none"  # @param ["none", "dolly-in", "dolly-out", "dolly-left", "dolly-right", "jib-up", "jib-down", "static"]
-CAMERA_LORA_STRENGTH = 1.0     # @param {type:"number"}
+# ── Camera LoRA ───────────────────────────────────────────────────────────────
+CAMERA_LORA = "none"  # @param ["none", "dolly-in", "dolly-out", "dolly-left", "dolly-right", "jib-up", "jib-down", "static"]
+CAMERA_LORA_STRENGTH = 1.0  # @param {type:"number"}
 
-# ── Memory & performance flags ────────────────────────────────────────────────
-USE_SAGE_ATTENTION      = False  # @param {type:"boolean"}
-# Apply PathchSageAttentionKJ (KJNodes) before inference.
-# Speeds up attention on GPUs with flash-attention support.
+_CAMERA_LORA_FILES = {
+    "none": "None",
+    "dolly-in": "ltx-2-19b-lora-camera-control-dolly-in.safetensors",
+    "dolly-out": "ltx-2-19b-lora-camera-control-dolly-out.safetensors",
+    "dolly-left": "ltx-2-19b-lora-camera-control-dolly-left.safetensors",
+    "dolly-right": "ltx-2-19b-lora-camera-control-dolly-right.safetensors",
+    "jib-up": "ltx-2-19b-lora-camera-control-jib-up.safetensors",
+    "jib-down": "ltx-2-19b-lora-camera-control-jib-down.safetensors",
+    "static": "ltx-2-19b-lora-camera-control-static.safetensors",
+}
 
-USE_CHUNK_FF            = False  # @param {type:"boolean"}
-# Apply LTXVChunkFeedForward for lower VRAM feedforward.
-# Useful on T4 (15 GB) for longer sequences.
+# ── User LoRA slots (strength) ────────────────────────────────────────────────
+# Note: distilled LoRA (ltx-2.3-22b-distilled-lora-384.safetensors) is mandatory
+# and always applied FIRST - not user-configurable.
+USER_LORA_1_STRENGTH = 1.0  # @param {type:"number"}
+USER_LORA_2_STRENGTH = 1.0  # @param {type:"number"}
+USER_LORA_3_STRENGTH = 1.0  # @param {type:"number"}
 
-PURGE_VRAM_AFTER_MODELS = True   # @param {type:"boolean"}
-# Explicitly call VRAM purge after model loading phases.
-# Tries LayerUtility: PurgeVRAM V2, falls back to torch.cuda.empty_cache.
+# ── Performance flags ─────────────────────────────────────────────────────────
+USE_SAGE_ATTENTION = False  # @param {type:"boolean"}
+USE_CHUNK_FF = False  # @param {type:"boolean"}
+PURGE_VRAM_AFTER_MODELS = True  # @param {type:"boolean"}
 
-# ── Pro Sampling Mode (from SVI-Pro-Workflow.json) ────────────────────────────
-PRO_MODE      = False    # @param {type:"boolean"}
-# When True, replaces ManualSigmas with:
-#   ModelSamplingSD3(shift=8) + BasicScheduler + SplitSigmas
-# This mirrors the SVI-Pro-Workflow.json sigma scheduling approach.
+# ── PRO Mode settings ─────────────────────────────────────────────────────────
+PRO_MODE = False  # @param {type:"boolean"}
+MOTION_STRENGTH = 0.75  # @param {type:"number"}
+USE_VOICE_SYNC_STRENGTH = 0.95  # @param {type:"number"}
 
-PRO_STEPS     = 4        # @param {type:"integer"}
-# Number of steps for BasicScheduler (SVI-Pro default: 4).
-
-PRO_SCHEDULER = "simple" # @param {type:"string"}
-# Scheduler name for BasicScheduler (SVI-Pro default: "simple").
-
-PRO_SPLIT_AT  = 2        # @param {type:"integer"}
-# Step index for SplitSigmas — splits denoising into high/low sigma passes.
-
-# ── Build LoRA stack from dropdowns ──────────────────────────────────────────
-# Slot 1 = IC LoRA, Slot 2 = Camera LoRA, Slots 3-10 = empty
-LORA_STACK      = _build_lora_stack(IC_LORA, IC_LORA_STRENGTH,
-                                     CAMERA_LORA, CAMERA_LORA_STRENGTH)
-LORA_STACK_JSON = json.dumps(LORA_STACK)
-
-_active_count = sum(1 for s in LORA_STACK if s["on"])
-print("✅ Character Consistency & LoRA configuration ready.")
-print(f"   Character mode : {CHARACTER_CONSISTENCY_MODE}  |  strength: {CHARACTER_STRENGTH}")
-print(f"   Character image: {CHARACTER_IMAGE_PATH or 'None'}")
-print(f"   IC LoRA        : {IC_LORA} @ {IC_LORA_STRENGTH}")
-print(f"   Camera LoRA    : {CAMERA_LORA} @ {CAMERA_LORA_STRENGTH}")
-print(f"   Active LoRA slots: {_active_count}/10")
-print(f"   Pro Mode       : {PRO_MODE}  |  SageAttn: {USE_SAGE_ATTENTION}  |  ChunkFF: {USE_CHUNK_FF}")
+print("Character & LoRA configuration ready.")
+print(f"   Character mode: {CHARACTER_CONSISTENCY_MODE} | strength: {CHARACTER_STRENGTH}")
+print(f"   IC LoRA: {IC_LORA} @ {IC_LORA_STRENGTH}")
+print(f"   Camera LoRA: {CAMERA_LORA} @ {CAMERA_LORA_STRENGTH}")
+print(f"   SageAttn: {USE_SAGE_ATTENTION} | ChunkFF: {USE_CHUNK_FF}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -840,1169 +1300,875 @@ print(f"   Pro Mode       : {PRO_MODE}  |  SageAttn: {USE_SAGE_ATTENTION}  |  Ch
 # ══════════════════════════════════════════════════════════════════════════════
 
 # @title  { "single-column": true }
-# @markdown ## 💥 6. Configure Your Video
-# @markdown Edit these settings before each generation run.
+# @markdown ## 6. Video Generation Configuration
 
-# ── Simple input (expanded by LTX2PromptArchitect) ───────────────────────────
+# ── Simple input (expanded by EasyPromptEngine) ──────────────────────────────
 USER_INPUT = (  # @param {type:"string"}
     "a woman walks through a rain-soaked city street at night, "
     "neon reflections on the wet pavement, looking over her shoulder"
 )
-# When BYPASS_EASY_PROMPT=False this is expanded by the LLM.
-# When BYPASS_EASY_PROMPT=True it is ignored — POSITIVE_PROMPT is used directly.
 
 # ── Reference / seed image (optional) ────────────────────────────────────────
-IMAGE_PATH = None   # @param {type:"string"}
-# e.g. "/content/ComfyUI/input/scene_reference.jpg"
-# When set + CHARACTER_CONSISTENCY_MODE includes "i2v": used as first frame.
-# When set + USE_VISION=True: Vision Describe analyses it for scene context.
-
+IMAGE_PATH = None  # @param {type:"string"}
 IMAGE_STRENGTH = 1.0  # @param {type:"number"}
-# I2V conditioning strength. 1.0 = strong (character stays close to reference).
 
-# ── Manual prompt (BYPASS_EASY_PROMPT=True only) ─────────────────────────────
+# ── Manual prompts (BYPASS_EASY_PROMPT=True only) ─────────────────────────────
 POSITIVE_PROMPT = (  # @param {type:"string"}
     "Busy city street at night, cinematic, neon reflections on wet pavement, "
-    "woman walking, bokeh streetlights, moody atmosphere, ultra detailed, "
-    "professional cinematography, shallow depth of field, film grain"
+    "woman walking, bokeh streetlights, moody atmosphere, ultra detailed"
 )
 NEGATIVE_PROMPT = (  # @param {type:"string"}
     "blurry, distorted, low quality, watermark, text, bad anatomy, deformed, "
-    "grainy, overexposed, underexposed, flickering, motion artifacts, flat lighting"
+    "grainy, overexposed, underexposed, flickering, motion artifacts"
 )
 
 # ── Resolution & length ───────────────────────────────────────────────────────
-WIDTH  = 768   # @param {type:"integer"}
-HEIGHT = 512   # @param {type:"integer"}
-FRAMES = 121   # @param {type:"integer"}
-FPS    = 25    # @param {type:"integer"}
-# T4  safe defaults : 768×512,   121 frames (~4.8s)
-# L4  (24 GB)       : 1024×576,  161 frames (~6.4s)
-# A100 (40 GB)      : 1280×720,  241 frames (~9.6s)
+WIDTH = 832  # @param {type:"integer"}
+HEIGHT = 480  # @param {type:"integer"}
+FRAMES = 121  # @param {type:"integer"}
+FPS = 25  # @param {type:"integer"}
 
-# ── Seed ─────────────────────────────────────────────────────────────────────
-SEED                = 47    # @param {type:"integer"}
+# ── Seed ──────────────────────────────────────────────────────────────────────
+SEED = 42  # @param {type:"integer"}
 AUTO_INCREMENT_SEED = True  # @param {type:"boolean"}
-# Mirrors "Shared seed" node [284] increment mode in LD-I2V.json.
 
-# ── Model filenames ───────────────────────────────────────────────────────────
-UNET_MODEL      = "ltx-2-19b-distilled_Q4_K_M.gguf"
-# Gemma: choose ONE matching your GPU (fp4 for Blackwell, fp8 for T4/A100)
-CLIP_NAME1      = "gemma_3_12B_it_fp4_mixed.safetensors"
-CLIP_NAME2      = "ltx-2-19b-embeddings_connector_distill_bf16.safetensors"
-VAE_VIDEO_MODEL = "LTX2_video_vae_bf16.safetensors"
-VAE_AUDIO_MODEL = "LTX2_audio_vae_bf16.safetensors"
-UPSCALER_MODEL  = "ltx-2-spatial-upscaler-x2-1.0.safetensors"
+# ── Model filenames (LTX 2.3 versions) ───────────────────────────────────────
+UNET_MODEL = "ltx-2.3-22b-dev-Q4_K_M.gguf"
+CLIP_NAME1 = "gemma_3_12B_it_fp8_scaled.safetensors"
+CLIP_NAME2 = "ltx-2.3-22b-dev_embeddings_connectors.safetensors"
+CLIP_GGUF_NAME1 = "gemma-3-12b-it-qat-UD-Q4_K_XL.gguf"
+CLIP_GGUF_NAME2 = "mmproj-BF16.gguf"
+VAE_VIDEO_MODEL = "ltx-2.3-22b-dev_video_vae.safetensors"
+VAE_AUDIO_MODEL = "ltx-2.3-22b-dev_audio_vae.safetensors"
+UPSCALER_MODEL = "ltx-2.3-spatial-upscaler-x2-1.0.safetensors"
+DISTILLED_LORA = "ltx-2.3-22b-distilled-lora-384.safetensors"
 
-# ── Pass 1 sampling (ManualSigmas schedule — proven for GGUF distilled) ───────
-# Node: ManualSigmas (replaces LTXVScheduler for GGUF distilled compatibility)
-PASS1_SIGMAS  = "1., 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0"
-PASS1_SAMPLER = "euler"           # @param {type:"string"}
-PASS1_CFG     = 1.0               # @param {type:"number"}
+# ── Sigma schedules ───────────────────────────────────────────────────────────
+PASS1_SIGMAS = "1., 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0"
+PASS1_SAMPLER = "euler"  # @param {type:"string"}
+PASS1_CFG = 1.0  # @param {type:"number"}
 
-# ── Pass 2 sampling (spatial upscale + refinement) ────────────────────────────
-PASS2_SIGMAS  = "0.909375, 0.725, 0.421875, 0.0"
+PASS2_SIGMAS = "0.909375, 0.725, 0.421875, 0.0"
 PASS2_SAMPLER = "gradient_estimation"  # @param {type:"string"}
-PASS2_CFG     = 1.0                    # @param {type:"number"}
-PASS2_SEED    = 0                      # @param {type:"integer"}
+PASS2_CFG = 1.0  # @param {type:"number"}
+PASS2_SEED = 0  # @param {type:"integer"}
 
 # ── Tiled VAE decode ──────────────────────────────────────────────────────────
-# Node [265] LTXVSpatioTemporalTiledVAEDecode from ComfyUI-LTXVideo
-USE_TILED_VAE          = True   # @param {type:"boolean"}
-TILED_SPATIAL_TILES    = 2      # @param {type:"integer"}
-TILED_SPATIAL_OVERLAP  = 8      # @param {type:"integer"}
-TILED_TEMPORAL_LEN     = 48     # @param {type:"integer"}
-TILED_TEMPORAL_OVERLAP = 4      # @param {type:"integer"}
-TILED_LAST_FRAME_FIX   = False  # @param {type:"boolean"}
+USE_TILED_VAE = True  # @param {type:"boolean"}
+TILED_SPATIAL_TILES = 2  # @param {type:"integer"}
+TILED_SPATIAL_OVERLAP = 8  # @param {type:"integer"}
+TILED_TEMPORAL_LEN = 48  # @param {type:"integer"}
+TILED_TEMPORAL_OVERLAP = 4  # @param {type:"integer"}
 
 # ── Output ────────────────────────────────────────────────────────────────────
-OUTPUT_PREFIX = "LTX-2-PRO"  # @param {type:"string"}
-
-# ── Storyboard continuity ─────────────────────────────────────────────────────
+OUTPUT_PREFIX = "LTX-2.3-PRO"  # @param {type:"string"}
 USE_SCENE_CONTINUITY = True  # @param {type:"boolean"}
-# When True in run_storyboard(), the last frame of scene N becomes
-# the image_path seed for scene N+1 (seamless continuity).
 
-print("✅ Configuration set.")
-print(f"   Resolution : {WIDTH}×{HEIGHT}  |  Frames : {FRAMES}  ({FRAMES/FPS:.1f}s @ {FPS}fps)")
-print(f"   UNet       : {UNET_MODEL}")
-print(f"   Seed       : {SEED}  (auto-increment: {AUTO_INCREMENT_SEED})")
-print(f"   Pass 1     : {PASS1_SAMPLER}  |  {PASS1_SIGMAS[:45]}…")
-print(f"   Pass 2     : {PASS2_SAMPLER}  |  {PASS2_SIGMAS}")
-print(f"   Pro Mode   : {PRO_MODE}  |  steps={PRO_STEPS}, scheduler={PRO_SCHEDULER}, split@{PRO_SPLIT_AT}")
+print("Video configuration set.")
+print(f"   Resolution: {WIDTH}x{HEIGHT} | Frames: {FRAMES} ({FRAMES/FPS:.1f}s @ {FPS}fps)")
+print(f"   UNet: {UNET_MODEL}")
+print(f"   Distilled LoRA: {DISTILLED_LORA} (mandatory, applied first)")
+print(f"   Seed: {SEED} (auto-increment: {AUTO_INCREMENT_SEED})")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CELL 7  ─  DEFINE generate_pro()
+# CELL 7  ─  DEFINE generate_clip()
 # ══════════════════════════════════════════════════════════════════════════════
 
 # @title  { "single-column": true }
-# @markdown ## 💥 7. Define generate_pro()
-# @markdown Run this cell once per session. Edit Cells 5-6 and re-run Cell 9.
+# @markdown ## 7. Define generate_clip()
+# @markdown Two-pass LTX-2.3 pipeline with CLIP-delete-before-UNet VRAM strategy.
+# @markdown Distilled LoRA is applied FIRST before any other LoRAs.
 
-def generate_pro(
-    user_input:              str   = USER_INPUT,
-    image_path:              str   = IMAGE_PATH,
-    positive_prompt:         str   = POSITIVE_PROMPT,
-    negative_prompt:         str   = NEGATIVE_PROMPT,
-    width:                   int   = WIDTH,
-    height:                  int   = HEIGHT,
-    frames:                  int   = FRAMES,
-    fps:                     int   = FPS,
-    seed:                    int   = SEED,
-    image_strength:          float = IMAGE_STRENGTH,
-    character_image_path:    str   = CHARACTER_IMAGE_PATH,
-    character_strength:      float = CHARACTER_STRENGTH,
-    character_mode:          str   = CHARACTER_CONSISTENCY_MODE,
-    character_name:          str   = CHARACTER_NAME,
-    character_description:   str   = CHARACTER_DESCRIPTION,
-    pass1_sigmas:            str   = PASS1_SIGMAS,
-    pass1_sampler:           str   = PASS1_SAMPLER,
-    pass1_cfg:               float = PASS1_CFG,
-    pass2_sigmas:            str   = PASS2_SIGMAS,
-    pass2_sampler:           str   = PASS2_SAMPLER,
-    pass2_cfg:               float = PASS2_CFG,
-    pass2_seed:              int   = PASS2_SEED,
-    pro_mode:                bool  = PRO_MODE,
-    pro_steps:               int   = PRO_STEPS,
-    pro_scheduler:           str   = PRO_SCHEDULER,
-    pro_split_at:            int   = PRO_SPLIT_AT,
-    use_tiled_vae:           bool  = USE_TILED_VAE,
-    tiled_spatial_tiles:     int   = TILED_SPATIAL_TILES,
-    tiled_spatial_overlap:   int   = TILED_SPATIAL_OVERLAP,
-    tiled_temporal_len:      int   = TILED_TEMPORAL_LEN,
-    tiled_temporal_overlap:  int   = TILED_TEMPORAL_OVERLAP,
-    tiled_last_frame_fix:    bool  = TILED_LAST_FRAME_FIX,
-    lora_stack:              list  = None,
-    lora_stack_json:         str   = None,
-    output_prefix:           str   = OUTPUT_PREFIX,
-    # ── EasyPrompt / Vision settings (read from module globals by default) ──
-    # These can be overridden per-call for storyboard/batch use.
-    bypass_easy_prompt:      bool  = None,   # None → use BYPASS_EASY_PROMPT global
-    llm_model:               str   = None,   # None → use LLM_MODEL global
-    use_vision:              bool  = None,   # None → use USE_VISION global
-    vision_model:            str   = None,   # None → use VISION_MODEL global
-    unet_model:              str   = None,   # None → use UNET_MODEL global
-    clip_name1:              str   = None,   # None → use CLIP_NAME1 global
-    clip_name2:              str   = None,   # None → use CLIP_NAME2 global
-) -> Optional[str]:
+def generate_clip(
+    image_tensor: Optional[torch.Tensor] = None,
+    prompt: str = "",
+    neg_prompt: str = "",
+    width: int = 832,
+    height: int = 480,
+    frames: int = 121,
+    fps: int = 25,
+    seed: int = 42,
+    image_strength: float = 1.0,
+    pass1_sigmas: str = PASS1_SIGMAS,
+    pass1_sampler: str = PASS1_SAMPLER,
+    pass1_cfg: float = PASS1_CFG,
+    pass2_sigmas: str = PASS2_SIGMAS,
+    pass2_sampler: str = PASS2_SAMPLER,
+    pass2_cfg: float = PASS2_CFG,
+    pass2_seed: int = PASS2_SEED,
+    use_tiled_vae: bool = USE_TILED_VAE,
+    tiled_stiles: int = TILED_SPATIAL_TILES,
+    tiled_soverlap: int = TILED_SPATIAL_OVERLAP,
+    tiled_tlen: int = TILED_TEMPORAL_LEN,
+    tiled_toverlap: int = TILED_TEMPORAL_OVERLAP,
+    ic_lora: str = None,
+    ic_lora_strength: float = 0.4,
+    camera_lora_file: str = None,
+    camera_lora_strength: float = 1.0,
+    output_prefix: str = OUTPUT_PREFIX,
+) -> str:
     """
-    LTX-2 PRO — Two-pass generation pipeline with Character Consistency.
+    Two-pass LTX-2.3 22B GGUF generation for one clip.
+    T4-safe VRAM strategy: CLIP is deleted before UNet loads.
 
-    Integrates nodes from LD-I2V.json + SVI-Pro-Workflow.json.
-    All ComfyUI node calls are annotated with [JSON node id / type].
+    VRAM sequence:
+      1. Load CLIP (DualCLIPLoader) - safetensors Gemma primary + GGUF fallback
+      2. Encode text (CLIPTextEncode + ConditioningZeroOut + LTXVConditioning.EXECUTE_NORMALIZED)
+      3. DELETE CLIP (frees 6-8 GB)
+      4. Load UNet (UnetLoaderGGUF - ltx-2.3-22b-dev-Q4_K_M.gguf)
+      5. Apply distilled LoRA FIRST (ltx-2.3-22b-distilled-lora-384.safetensors @ 1.0)
+      6. Apply IC LoRA, camera LoRA, user LoRAs
+      7. Load VAEs + upscaler
+      8. Prepare latents using tensor_width_height()
+      9. I2V conditioning if image provided
+      10. Audio latent + concat AV
+      11. Pass 1 (euler + ManualSigmas)
+      12. Separate AV + CropGuides + CFGGuider for Pass 2
+      13. LTXVLatentUpsampler (spatial x2)
+      14. Pass 2 (gradient_estimation + ManualSigmas)
+      15. DELETE UNet
+      16. Decode video (tiled or standard VAEDecode)
+      17. Decode audio (LTXVAudioVAEDecode)
+      18. Delete VAEs
+      19. CreateVideo + save
 
-    ┌──────────────────────────────────────────────────────────────────────┐
-    │  PHASE 0 — EASY PROMPT (before video model — LLM/Vision then unload) │
-    │                                                                      │
-    │  [LTX2VisionDescribe]  image  ──────────────────► scene_context     │
-    │  [LTX2PromptArchitect] user_input + scene_ctx ──► positive, neg     │
-    ├──────────────────────────────────────────────────────────────────────┤
-    │  PHASE 1 — MODEL LOADING                                             │
-    │                                                                      │
-    │  [197/UnetLoaderGGUF]     ──► unet (raw)                            │
-    │  [190/DualCLIPLoader]     ──► clip_model                            │
-    │  [263/LTX2MasterLoaderLD] ──► unet + clip (LoRA stack)              │
-    │  [PathchSageAttentionKJ]  ──► unet (sage attn patch, optional)      │
-    │  [LTXVChunkFeedForward]   ──► unet (chunk FF patch, optional)       │
-    │  [184/VAELoader]          ──► vae_video                             │
-    │  [196/VAELoaderKJ]        ──► vae_audio                             │
-    │  [189/LatentUpscaleModel] ──► upscale_model                         │
-    ├──────────────────────────────────────────────────────────────────────┤
-    │  PHASE 2 — TEXT ENCODING                                             │
-    │                                                                      │
-    │  [121/CLIPTextEncode]     positive ──► cond_pos                     │
-    │  [110/CLIPTextEncode]     negative ──► cond_neg                     │
-    │  [ConditioningZeroOut]    cond_pos  ──► zero_out (for neg branch)   │
-    │  [107/LTXVConditioning]   fps meta  ──► cond[0]=pos, cond[1]=neg    │
-    ├──────────────────────────────────────────────────────────────────────┤
-    │  PHASE 3 — CHARACTER ANCHOR (mode "anchor" or "both")               │
-    │                                                                      │
-    │  [165/ImageResizeKJv2]    char_img  ──► resized to W×H              │
-    │  [295/VAEEncode]          pixels    ──► anchor_samples LATENT       │
-    │                           SetNode  ──► "anchor_samples" slot        │
-    ├──────────────────────────────────────────────────────────────────────┤
-    │  PHASE 4 — LATENT PREPARATION                                        │
-    │                                                                      │
-    │  [246/ResizeImagesByLongerEdge]  image ──► 1536px long-edge         │
-    │  [165/ImageResizeKJv2]           image ──► target W×H, lanczos      │
-    │  [164/ResizeImageMaskNode]       image ──► ×0.5 half-res            │
-    │  [163/GetImageSize]              ──► half_w, half_h                 │
-    │  [108/EmptyLTXVLatentVideo]      ──► vid_lat (half-res)             │
-    │  [162/LTXVPreprocess]            img_compression=33 ──► pp_img      │
-    │  [161/LTXVImgToVideoInplace]     I2V mode ──► vid_lat (conditioned) │
-    │  [199/LTXVEmptyLatentAudio]      ──► aud_lat                        │
-    │  [109/LTXVConcatAVLatent]        vid_lat+aud_lat ──► combined       │
-    ├──────────────────────────────────────────────────────────────────────┤
-    │  PHASE 5 — SIGMA SCHEDULE                                            │
-    │                                                                      │
-    │  Standard: [ManualSigmas] pass1_sigmas ──► sig_p1                   │
-    │  PRO mode: [ModelSamplingSD3 shift=8] + [BasicScheduler] +          │
-    │            [SplitSigmas step=pro_split_at] ──► sig_high, sig_low    │
-    │            [KSamplerSelect euler] ──► sampler                       │
-    ├──────────────────────────────────────────────────────────────────────┤
-    │  PHASE 6 — PASS 1 (first-pass denoising)                            │
-    │                                                                      │
-    │  [CFGGuider]  model + pos/neg ──► guider_p1                         │
-    │  [RandomNoise] seed ──► noise_p1                                    │
-    │  [SamplerCustomAdvanced] ──► p1_av_output                           │
-    ├──────────────────────────────────────────────────────────────────────┤
-    │  PHASE 7 — PASS 2 (spatial upscale + refinement)                    │
-    │                                                                      │
-    │  [LTXVSeparateAVLatent]  p1_av ──► vid_lat_p1, aud_lat_p1          │
-    │  [LTXVCropGuides]        pos/neg + lat ──► cropped cond + lat       │
-    │  [CFGGuider]  model + cropped ──► guider_p2                         │
-    │  [LTXVLatentUpsampler]   ×2 upsample ──► upsampled                  │
-    │  [LTXVConcatAVLatent]    upsampled + aud ──► av_lat2                │
-    │  PRO: sig_low  |  Standard: [ManualSigmas] pass2_sigmas             │
-    │  [SamplerCustomAdvanced] ──► p2_denoised                            │
-    ├──────────────────────────────────────────────────────────────────────┤
-    │  PHASE 8 — DECODE                                                    │
-    │                                                                      │
-    │  [LTXVSeparateAVLatent]                                              │
-    │  [265/LTXVSpatioTemporalTiledVAEDecode] or [VAEDecode] ──► frames   │
-    │  [201/LTXVAudioVAEDecode] ──► audio                                 │
-    ├──────────────────────────────────────────────────────────────────────┤
-    │  PHASE 9 — SAVE                                                      │
-    │                                                                      │
-    │  [319/VHS_VideoCombine] h264-mp4, crf=19, yuv420p (preferred)       │
-    │  Fallback: [CreateVideo] ──► save_video_from_components             │
-    │  save_metadata_sidecar() ──► JSON sidecar                           │
-    └──────────────────────────────────────────────────────────────────────┘
-
-    Returns: output video path (str) or None on failure.
+    Returns: output video file path (str)
     """
-    t0 = time.time()
     import_custom_nodes()
-    clear_output()
 
-    _lora_stack = lora_stack if lora_stack is not None else LORA_STACK
-    _lora_json  = lora_stack_json if lora_stack_json is not None else LORA_STACK_JSON
-    _char_mode  = character_mode.lower().strip()
+    img_bypass = image_tensor is None
+    img_str = image_strength if not img_bypass else 0.0
 
-    # Resolve per-call overrides vs. module globals
-    _bypass     = bypass_easy_prompt if bypass_easy_prompt is not None else BYPASS_EASY_PROMPT
-    _llm_model  = llm_model  if llm_model  is not None else LLM_MODEL
-    _use_vision = use_vision if use_vision is not None else USE_VISION
-    _vis_model  = vision_model if vision_model is not None else VISION_MODEL
-    _unet       = unet_model  if unet_model  is not None else UNET_MODEL
-    _clip1      = clip_name1  if clip_name1  is not None else CLIP_NAME1
-    _clip2      = clip_name2  if clip_name2  is not None else CLIP_NAME2
-
-    print("🎬 LTX-2 PRO — Generation Starting")
-    print(f"   Resolution   : {width}×{height}  |  Frames: {frames}  |  Seed: {seed}")
-    print(f"   Mode         : {'I2V' if image_path else 'T2V'}"
-          f"  |  Character: {_char_mode}  |  Pro: {pro_mode}")
-    print(f"   Easy Prompt  : {'BYPASS' if _bypass else f'LLM={_llm_model}'}")
-    _print_vram()
-
-    # ── Pre-flight model check ─────────────────────────────────────────────
-    print("\n🔍 Model file check…")
-    all_ok = validate_model_files({
-        "unet"    : _unet,
-        "clip1"   : _clip1,
-        "clip2"   : _clip2,
-        "vae_vid" : VAE_VIDEO_MODEL,
-        "vae_aud" : VAE_AUDIO_MODEL,
-        "upscaler": UPSCALER_MODEL,
-    })
-    if not all_ok:
-        raise FileNotFoundError(
-            "One or more model files are missing — run Cell 2 first.\n"
-            "  Tip: Check CLIP_NAME1 — use fp8 if fp4 is not available for your GPU."
-        )
-
-    # ══════════════════════════════════════════════════════════════════════
-    # PHASE 0 — EASY PROMPT (LLM + Vision before video model loads)
-    # ══════════════════════════════════════════════════════════════════════
-
-    # Load reference image tensor for Vision and/or I2V conditioning
-    seed_image_tensor = None
-    if image_path:
-        seed_image_tensor = load_image_tensor(image_path)
-        if seed_image_tensor is None:
-            print(f"   ⚠️  Image not found: {image_path} — switching to T2V")
-        else:
-            print(f"   ✓ Reference image loaded: {image_path}  {seed_image_tensor.shape}")
-
-    # Load character image tensor for consistency anchor
-    char_image_tensor = None
-    if character_image_path and _char_mode != "none":
-        char_image_tensor = load_image_tensor(character_image_path)
-        if char_image_tensor is None:
-            print(f"   ⚠️  Character image not found: {character_image_path} — skipping anchor.")
-        else:
-            print(f"   ✓ Character image loaded: {character_image_path}  {char_image_tensor.shape}")
-
-    # Determine analysis image: prefer character image for vision analysis
-    analysis_tensor = char_image_tensor if char_image_tensor is not None else seed_image_tensor
-
-    # Vision Describe — LTX2VisionDescribe node
-    scene_context = character_description or ""
-    if analysis_tensor is not None and _use_vision and not _bypass:
-        print("\n👁️  Vision Describe…")
-        # character_description is fed as seed to bias description toward the character
-        scene_context = run_vision_describe(
-            analysis_tensor,
-            character_description,
-            use_vision_override=_use_vision,
-            vision_model_override=_vis_model)
-        if scene_context:
-            print(f"   Scene context: {scene_context[:120]}…")
-
-    # Easy Prompt expansion — LTX2PromptArchitect node
-    final_positive = positive_prompt
-    final_negative = negative_prompt
-    if not _bypass and user_input.strip():
-        print("\n🧠 Easy Prompt expansion…")
-        final_positive, final_negative = run_easy_prompt(
-            user_input=user_input,
-            frame_count=frames,
-            seed=seed,
-            scene_context=scene_context,
-            llm_model_override=_llm_model,
-        )
-        print(f"\n   ── EXPANDED PROMPT ─────────────────────────────────────")
-        print(f"   {final_positive[:300]}{'…' if len(final_positive) > 300 else ''}")
-        print(f"\n   ── NEGATIVE PROMPT ─────────────────────────────────────")
-        print(f"   {final_negative[:150]}…")
-    else:
-        print("   [EasyPrompt] Bypassed — using manual POSITIVE_PROMPT.")
-
-    # LLM/Vision should now be unloaded — free VRAM before loading video model
-    cleanup_memory(verbose=True)
-
-    # ══════════════════════════════════════════════════════════════════════
-    # PHASE 1 — MODEL LOADING
-    # ══════════════════════════════════════════════════════════════════════
+    print(f"   [Clip] {'I2V' if not img_bypass else 'T2V'}  "
+          f"{width}x{height}  {frames}f  seed={seed}")
 
     with torch.inference_mode():
 
-        # ── UNet: UnetLoaderGGUF ──────────────────────────────────────────
-        # [197] UnetLoaderGGUF in LD-I2V.json — loads GGUF Q4_K_M distilled
-        print("\n📦 Loading UNet (GGUF Q4_K_M distilled)…")
+        # ══════════════════════════════════════════════════════════════════
+        # STEP 1: Load CLIP (DualCLIPLoader)
+        # Primary: gemma_3_12B_it_fp8_scaled + ltx-2.3 embeddings connector
+        # Fallback: GGUF Gemma + mmproj pair
+        # ══════════════════════════════════════════════════════════════════
+        print("   [Clip] Loading CLIP...")
+        dualcliploader = NODE_CLASS_MAPPINGS["DualCLIPLoader"]()
         try:
-            unet_loader = NODE_CLASS_MAPPINGS["UnetLoaderGGUF"]()
-            unet        = get_value_at_index(
-                unet_loader.load_unet(unet_name=_unet), 0)
-        except KeyError:
-            raise RuntimeError(
-                "UnetLoaderGGUF not found.\n"
-                "  Fix: Run Cell 1 to clone ComfyUI_GGUF custom node."
+            dualcliploader_result = dualcliploader.load_clip(
+                clip_name1=CLIP_NAME1,
+                clip_name2=CLIP_NAME2,
+                type="ltxv",
+                device="default",
+            )
+        except Exception as clip_error:
+            print(f"   Primary CLIP load failed, trying GGUF fallback: {clip_error}")
+            dualcliploader_result = dualcliploader.load_clip(
+                clip_name1=CLIP_GGUF_NAME1,
+                clip_name2=CLIP_GGUF_NAME2,
+                type="ltxv",
+                device="default",
             )
 
-        # ── DualCLIPLoader ────────────────────────────────────────────────
-        # [190] DualCLIPLoader — Gemma text encoder + embeddings connector
-        print("   Loading CLIP encoders (DualCLIPLoader)…")
-        try:
-            clip_loader = NODE_CLASS_MAPPINGS["DualCLIPLoader"]()
-            clip_model  = get_value_at_index(
-                clip_loader.load_clip(
-                    clip_name1=_clip1,
-                    clip_name2=_clip2,
-                    type="ltxv",
-                    device="default"), 0)
-        except Exception as e:
-            print(f"   ⚠️  fp4 CLIP failed ({type(e).__name__}: {e})")
-            print("      Trying fp8 fallback (gemma_3_12B_it_fp8_scaled.safetensors)…")
-            fp8 = "gemma_3_12B_it_fp8_scaled.safetensors"
+        clip_model = get_value_at_index(dualcliploader_result, 0)
+
+        # ══════════════════════════════════════════════════════════════════
+        # STEP 2: Text encoding
+        # CLIPTextEncode + ConditioningZeroOut + LTXVConditioning.EXECUTE_NORMALIZED
+        # ══════════════════════════════════════════════════════════════════
+        cliptextencode = NODE_CLASS_MAPPINGS["CLIPTextEncode"]()
+        cliptextencode_pos = cliptextencode.encode(
+            text=prompt,
+            clip=clip_model,
+        )
+
+        conditioningzeroout = NODE_CLASS_MAPPINGS["ConditioningZeroOut"]()
+        conditioningzeroout_neg = conditioningzeroout.zero_out(
+            conditioning=get_value_at_index(cliptextencode_pos, 0)
+        )
+
+        ltxvconditioning = NODE_CLASS_MAPPINGS["LTXVConditioning"]()
+        ltxvconditioning_result = ltxvconditioning.EXECUTE_NORMALIZED(
+            frame_rate=fps,
+            positive=get_value_at_index(cliptextencode_pos, 0),
+            negative=get_value_at_index(conditioningzeroout_neg, 0),
+        )
+
+        # ══════════════════════════════════════════════════════════════════
+        # STEP 3: DELETE CLIP (frees 6-8 GB for UNet)
+        # ══════════════════════════════════════════════════════════════════
+        del clip_model, dualcliploader_result
+        torch.cuda.empty_cache()
+        gc.collect()
+        print("   [Clip] CLIP deleted, VRAM freed")
+
+        # ══════════════════════════════════════════════════════════════════
+        # STEP 4: Load UNet (UnetLoaderGGUF)
+        # ══════════════════════════════════════════════════════════════════
+        print("   [Clip] Loading UNet (GGUF Q4_K_M)...")
+        unetloadergguf = NODE_CLASS_MAPPINGS["UnetLoaderGGUF"]()
+        unetloadergguf_result = unetloadergguf.load_unet(unet_name=UNET_MODEL)
+        unet = get_value_at_index(unetloadergguf_result, 0)
+
+        # ══════════════════════════════════════════════════════════════════
+        # STEP 5: Apply distilled LoRA FIRST (mandatory)
+        # ltx-2.3-22b-distilled-lora-384.safetensors @ 1.0
+        # ══════════════════════════════════════════════════════════════════
+        print("   [Clip] Applying distilled LoRA (mandatory, first)...")
+        load_lora = LoraLoaderModelOnly()
+        unet = load_lora.load_lora_model_only(unet, DISTILLED_LORA, 1.0)[0]
+
+        # ══════════════════════════════════════════════════════════════════
+        # STEP 6: Apply IC LoRA, camera LoRA, user LoRAs
+        # ══════════════════════════════════════════════════════════════════
+        # IC LoRA
+        _ic_file = _IC_LORA_FILES.get((ic_lora or IC_LORA).lower(), "None")
+        if _ic_file != "None":
+            _ic_str = ic_lora_strength if ic_lora else IC_LORA_STRENGTH
             try:
-                clip_model = get_value_at_index(
-                    clip_loader.load_clip(
-                        clip_name1=fp8, clip_name2=_clip2,
-                        type="ltxv", device="default"), 0)
-                print("   ✓ fp8 CLIP loaded.")
-            except Exception as e2:
-                raise RuntimeError(
-                    f"DualCLIPLoader failed: {e2}\n"
-                    "  Fix: Ensure CLIP_NAME1 file is downloaded (Cell 2).\n"
-                    "  fp4 needs Blackwell GPU; use fp8 for T4/A100."
-                )
-
-        # ── LoRA stack: LTX2MasterLoaderLD [263] ─────────────────────────
-        # [263] LTX2MasterLoaderLD in LD-I2V.json — 10-slot LoRA stacker
-        print("   Applying LoRA stack (LTX2MasterLoaderLD)…")
-        unet, clip_model = apply_lora_stack(unet, clip_model, _lora_stack, _lora_json)
-
-        # ── Optional performance patches ──────────────────────────────────
-        # [PathchSageAttentionKJ] — KJNodes flash-attention-style patch
-        unet = apply_sage_attention(unet)
-        # [LTXVChunkFeedForward] — ComfyUI-LTXVideo chunk feedforward
-        unet = apply_chunk_ff(unet)
-
-        # Purge VRAM after model loading if enabled
-        # [LayerUtility: PurgeVRAM V2] from LayerStyle nodes
-        purge_vram("after unet+lora")
-        _print_vram()
-
-        # ── VAELoader [184] — video VAE ───────────────────────────────────
-        # [184] VAELoader in LD-I2V.json
-        print("   Loading VAEs…")
-        vaeloader  = NODE_CLASS_MAPPINGS["VAELoader"]()
-        vae_video  = get_value_at_index(
-            vaeloader.load_vae(vae_name=VAE_VIDEO_MODEL), 0)
-
-        # [196] VAELoaderKJ (or VAELoader fallback) — audio VAE
-        try:
-            vae_audio = get_value_at_index(_load_audio_vae(VAE_AUDIO_MODEL), 0)
-        except Exception as e:
-            raise RuntimeError(
-                f"Audio VAE load failed: {e}\n"
-                "  Fix: Check VAE_AUDIO_MODEL filename in Cell 6."
-            )
-
-        # ── Spatial upscaler [189] ────────────────────────────────────────
-        # [189] LatentUpscaleModelLoader in LD-I2V.json
-        try:
-            uml = NODE_CLASS_MAPPINGS["LatentUpscaleModelLoader"]()
-            # Try EXECUTE_NORMALIZED first; fall back to load_model if absent
-            if hasattr(uml, "EXECUTE_NORMALIZED"):
-                upscale_model = get_value_at_index(
-                    uml.EXECUTE_NORMALIZED(model_name=UPSCALER_MODEL), 0)
-            elif hasattr(uml, "load_model"):
-                upscale_model = get_value_at_index(
-                    uml.load_model(model_name=UPSCALER_MODEL), 0)
-            else:
-                raise AttributeError("LatentUpscaleModelLoader: no load method found")
-        except Exception as e:
-            raise RuntimeError(
-                f"LatentUpscaleModelLoader failed: {e}\n"
-                "  Fix: Download UPSCALER_MODEL in Cell 2."
-            )
-
-        # ══════════════════════════════════════════════════════════════════
-        # PHASE 2 — TEXT ENCODING
-        # ══════════════════════════════════════════════════════════════════
-
-        print("\n📝 Encoding prompts…")
-        try:
-            # [121] CLIPTextEncode — positive
-            cte      = NODE_CLASS_MAPPINGS["CLIPTextEncode"]()
-            cond_pos = cte.encode(text=final_positive, clip=clip_model)
-
-            # [110] CLIPTextEncode — negative (empty for LTX, wrapped in ConditioningZeroOut)
-            cond_neg = cte.encode(text=final_negative, clip=clip_model)
-
-            # ConditioningZeroOut — applied to positive to create zero-out negative branch
-            # (mirrors reference notebook pattern for distilled model)
-            zero_out  = NODE_CLASS_MAPPINGS["ConditioningZeroOut"]()
-            cond_zero = zero_out.zero_out(
-                conditioning=get_value_at_index(cond_pos, 0))
-
-            # [107] LTXVConditioning — injects frame_rate into conditioning metadata
-            ltxv_cond = NODE_CLASS_MAPPINGS["LTXVConditioning"]()
-            cond = ltxv_cond.EXECUTE_NORMALIZED(
-                frame_rate=float(fps),
-                positive=get_value_at_index(cond_pos, 0),
-                negative=get_value_at_index(cond_zero, 0))
-            # cond[0] = positive with frame_rate metadata
-            # cond[1] = negative (zero-out)
-
-        except Exception as e:
-            raise RuntimeError(
-                f"Text encoding failed: {e}\n"
-                "  Fix: Check DualCLIPLoader output — CLIP may have failed to load."
-            )
-
-        del clip_model
-        cleanup_memory()
-
-        # ══════════════════════════════════════════════════════════════════
-        # PHASE 3 — CHARACTER ANCHOR (mode "anchor" or "both")
-        # NOTE: anchor_latent is computed AFTER half-res dimensions are known
-        # (Phase 4 preamble) so the VAEEncode output matches EmptyLTXVLatentVideo.
-        # ══════════════════════════════════════════════════════════════════
-
-        # ══════════════════════════════════════════════════════════════════
-        # PHASE 4 — LATENT PREPARATION
-        # ══════════════════════════════════════════════════════════════════
-
-        print("\n🗂️  Preparing latents…")
-        _print_vram()
-
-        # Determine input image for latent prep (I2V or T2V)
-        # For I2V: use image_path tensor. For anchor-only: use character image.
-        _ref_tensor = seed_image_tensor
-        if _ref_tensor is None and _char_mode in ("i2v", "both"):
-            _ref_tensor = char_image_tensor
-        _use_i2v = (_ref_tensor is not None and _char_mode in ("i2v", "both")) or \
-                   (_ref_tensor is not None and image_path is not None and _char_mode == "none")
-
-        # ── Compute half-resolution for Pass 1 latent ─────────────────────
-        # [256] EmptyImage → [164] ResizeImageMaskNode ×0.5 → [163] GetImageSize
-        ei       = NODE_CLASS_MAPPINGS["EmptyImage"]()
-        full_img = ei.generate(width=width, height=height, batch_size=1, color=0)
-
-        rimn     = NODE_CLASS_MAPPINGS["ResizeImageMaskNode"]()
-        half_img = rimn.EXECUTE_NORMALIZED(
-            input=get_value_at_index(full_img, 0),
-            scale_method="area",
-            resize_type={"resize_type": "scale by multiplier", "multiplier": 0.5})
-
-        gis     = NODE_CLASS_MAPPINGS["GetImageSize"]()
-        half_sz = gis.EXECUTE_NORMALIZED(image=get_value_at_index(half_img, 0))
-        half_w  = get_value_at_index(half_sz, 0)
-        half_h  = get_value_at_index(half_sz, 1)
-        print(f"   Latent dims : {half_w}×{half_h}  (half of {width}×{height})")
-
-        # ── Character Anchor encoding (Phase 3, deferred here for half-res dims) ──
-        # [295] VAEEncode from SVI-Pro-Workflow.json — encodes character image.
-        # We resize to half_w × half_h so the anchor latent matches EmptyLTXVLatentVideo.
-        anchor_latent = None
-        if char_image_tensor is not None and _char_mode in ("anchor", "both"):
-            print("\n🧬 Character Anchor — encoding character image as latent…")
-            try:
-                # [165] ImageResizeKJv2 — resize to HALF resolution (matches vid_lat)
-                # half_w × half_h ensures spatial dims match EmptyLTXVLatentVideo
-                ikj = NODE_CLASS_MAPPINGS["ImageResizeKJv2"]()
-                char_resized = get_value_at_index(
-                    ikj.resize(
-                        image=char_image_tensor,
-                        width=half_w,
-                        height=half_h,
-                        upscale_method="lanczos",
-                        keep_proportion="crop",
-                        pad_color="0, 0, 0",
-                        crop_position="center",
-                        divisible_by=32,
-                        device="cpu",
-                    ), 0)
-
-                # [295] VAEEncode — pixels at half_w × half_h → latent at ~(half_w/8 × half_h/8)
-                # This matches the spatial dims of EmptyLTXVLatentVideo(half_w, half_h)
-                vae_enc       = NODE_CLASS_MAPPINGS["VAEEncode"]()
-                anchor_latent = get_value_at_index(
-                    vae_enc.encode(pixels=char_resized, vae=vae_video), 0)
-                print(f"   ✓ Character anchor encoded at {half_w}×{half_h}  (mode={_char_mode})")
+                ll = LoraLoaderModelOnly()
+                unet = ll.load_lora_model_only(unet, _ic_file, _ic_str)[0]
+                print(f"   [Clip] IC LoRA: {_ic_file} @ {_ic_str}")
             except Exception as e:
-                print(f"   ⚠️  Character anchor failed ({e}) — continuing without anchor.")
-                anchor_latent = None
+                print(f"   [Clip] IC LoRA failed: {e}")
 
-        # [108] EmptyLTXVLatentVideo — half-res video latent
-        eltxv   = NODE_CLASS_MAPPINGS["EmptyLTXVLatentVideo"]()
-        vid_lat = eltxv.EXECUTE_NORMALIZED(
-            width=half_w, height=half_h, length=frames, batch_size=1)
-
-        # ── I2V conditioning branch ────────────────────────────────────────
-        if _use_i2v and _ref_tensor is not None:
+        # Camera LoRA
+        _cam_file = camera_lora_file or _CAMERA_LORA_FILES.get(CAMERA_LORA.lower(), "None")
+        _cam_str = camera_lora_strength if camera_lora_file else CAMERA_LORA_STRENGTH
+        if _cam_file != "None" and _cam_file is not None:
             try:
-                # Resize reference image to full target resolution first
-                # [246] ResizeImagesByLongerEdge — longer_edge=1536
-                if "ResizeImagesByLongerEdge" in NODE_CLASS_MAPPINGS:
-                    rle     = NODE_CLASS_MAPPINGS["ResizeImagesByLongerEdge"]()
-                    _ref_tensor = get_value_at_index(
-                        rle.resize(images=_ref_tensor, longer_edge=1536), 0)
-
-                # [165] ImageResizeKJv2 — precise resize to half_w*2 × half_h*2
-                if "ImageResizeKJv2" in NODE_CLASS_MAPPINGS:
-                    ikj2 = NODE_CLASS_MAPPINGS["ImageResizeKJv2"]()
-                    _ref_tensor = get_value_at_index(
-                        ikj2.resize(
-                            image=_ref_tensor,
-                            width=half_w * 2,
-                            height=half_h * 2,
-                            upscale_method="lanczos",
-                            keep_proportion="crop",
-                            pad_color="0, 0, 0",
-                            crop_position="center",
-                            divisible_by=2,
-                            device="cpu",
-                        ), 0)
-                else:
-                    # Fallback: ResizeImageMaskNode — use scale by multiplier to
-                    # approximate the target size. Note: "scale dimensions" mode is
-                    # not a valid resize_type for this node; only "scale by multiplier"
-                    # and "scale to fit" are documented in LD-I2V.json widgets_values.
-                    # We compute a representative scale factor for the longer edge.
-                    rim2 = NODE_CLASS_MAPPINGS["ResizeImageMaskNode"]()
-                    _orig_h, _orig_w = _ref_tensor.shape[1], _ref_tensor.shape[2]
-                    _scale = max((half_w * 2) / max(_orig_w, 1),
-                                 (half_h * 2) / max(_orig_h, 1))
-                    _ref_tensor = get_value_at_index(
-                        rim2.EXECUTE_NORMALIZED(
-                            input=_ref_tensor,
-                            scale_method="lanczos",
-                            resize_type={"resize_type": "scale by multiplier",
-                                         "multiplier": _scale}), 0)
-
-                # [162] LTXVPreprocess — compress/normalise image before I2V injection
-                # img_compression=33 matches LD-I2V.json node [162] widgets_values
-                pp_node = NODE_CLASS_MAPPINGS["LTXVPreprocess"]()
-                pp_img  = get_value_at_index(
-                    pp_node.EXECUTE_NORMALIZED(
-                        img_compression=33,
-                        image=_ref_tensor), 0)
-
-                # [161] LTXVImgToVideoInplace — inject image into video latent
-                # strength = character_strength (if char mode) else image_strength
-                _i2v_strength = character_strength if _char_mode in ("i2v", "both") \
-                                else image_strength
-                i2v     = NODE_CLASS_MAPPINGS["LTXVImgToVideoInplace"]()
-                vid_lat = i2v.EXECUTE_NORMALIZED(
-                    strength=_i2v_strength,
-                    bypass=False,
-                    vae=vae_video,
-                    image=pp_img,
-                    latent=get_value_at_index(vid_lat, 0))
-                print(f"   ✓ I2V conditioning applied  (strength={_i2v_strength}, "
-                      f"LTXVImgToVideoInplace)")
-            except KeyError as e:
-                print(f"   ⚠️  I2V node missing ({e}) — using empty latent (T2V mode).")
-                vid_lat = (get_value_at_index(vid_lat, 0),)
+                ll = LoraLoaderModelOnly()
+                unet = ll.load_lora_model_only(unet, _cam_file, _cam_str)[0]
+                print(f"   [Clip] Camera LoRA: {_cam_file} @ {_cam_str}")
             except Exception as e:
-                print(f"   ⚠️  I2V conditioning failed ({e}) — using empty latent.")
-                vid_lat = (get_value_at_index(vid_lat, 0),)
+                print(f"   [Clip] Camera LoRA failed: {e}")
+
+        # User LoRAs (downloaded in Cell 2)
+        if user_lora_1:
+            try:
+                ll = LoraLoaderModelOnly()
+                unet = ll.load_lora_model_only(unet, user_lora_1, USER_LORA_1_STRENGTH)[0]
+                print(f"   [Clip] User LoRA 1: {user_lora_1}")
+            except Exception as e:
+                print(f"   [Clip] User LoRA 1 failed: {e}")
+
+        if user_lora_2:
+            try:
+                ll = LoraLoaderModelOnly()
+                unet = ll.load_lora_model_only(unet, user_lora_2, USER_LORA_2_STRENGTH)[0]
+                print(f"   [Clip] User LoRA 2: {user_lora_2}")
+            except Exception as e:
+                print(f"   [Clip] User LoRA 2 failed: {e}")
+
+        if user_lora_3:
+            try:
+                ll = LoraLoaderModelOnly()
+                unet = ll.load_lora_model_only(unet, user_lora_3, USER_LORA_3_STRENGTH)[0]
+                print(f"   [Clip] User LoRA 3: {user_lora_3}")
+            except Exception as e:
+                print(f"   [Clip] User LoRA 3 failed: {e}")
+
+        # Optional performance patches
+        if USE_SAGE_ATTENTION:
+            unet = apply_sage_attention(unet)
+        if USE_CHUNK_FF:
+            unet = apply_chunk_ff(unet)
+
+        # ══════════════════════════════════════════════════════════════════
+        # STEP 7: Load VAEs + upscaler
+        # ══════════════════════════════════════════════════════════════════
+        vaeloader = NODE_CLASS_MAPPINGS["VAELoader"]()
+        vae_video = get_value_at_index(vaeloader.load_vae(vae_name=VAE_VIDEO_MODEL), 0)
+        vae_audio = get_value_at_index(load_audio_vae_compat(VAE_AUDIO_MODEL), 0)
+
+        latentupscalemodelloader = NODE_CLASS_MAPPINGS["LatentUpscaleModelLoader"]()
+        upscale_mdl = get_value_at_index(
+            latentupscalemodelloader.EXECUTE_NORMALIZED(model_name=UPSCALER_MODEL), 0)
+
+        # ══════════════════════════════════════════════════════════════════
+        # STEP 8: Prepare latents using tensor_width_height()
+        # latent_w = max(1, resized_w // 2) (NOT GetImageSize node)
+        # ══════════════════════════════════════════════════════════════════
+        resizeimagemasknode = NODE_CLASS_MAPPINGS["ResizeImageMaskNode"]()
+        resizeimagesbylongeredge = NODE_CLASS_MAPPINGS["ResizeImagesByLongerEdge"]()
+        ltxvpreprocess = NODE_CLASS_MAPPINGS["LTXVPreprocess"]()
+        emptyltxvlatentvideo = NODE_CLASS_MAPPINGS["EmptyLTXVLatentVideo"]()
+
+        # Prepare image for I2V (or create noise placeholder for T2V)
+        if not img_bypass:
+            # Resize provided image to target dimensions
+            resized_img = resizeimagemasknode.EXECUTE_NORMALIZED(
+                input=image_tensor,
+                scale_method="lanczos",
+                resize_type={
+                    "resize_type": "scale dimensions",
+                    "width": width,
+                    "height": height,
+                    "crop": "center",
+                }
+            )
+            resized_for_longer = resizeimagesbylongeredge.EXECUTE_NORMALIZED(
+                longer_edge=848,
+                images=get_value_at_index(resized_img, 0)
+            )
+            pp_img = get_value_at_index(ltxvpreprocess.EXECUTE_NORMALIZED(
+                img_compression=33,
+                image=get_value_at_index(resized_for_longer, 0),
+            ), 0)
+
+            # Get dimensions using tensor_width_height (NOT GetImageSize node)
+            resized_w, resized_h = tensor_width_height(get_value_at_index(resized_img, 0))
         else:
-            # T2V — use empty latent directly
-            vid_lat = (get_value_at_index(vid_lat, 0),)
+            # T2V: use configured dimensions directly
+            resized_w, resized_h = width, height
+            pp_img = None
 
-        # Inject anchor_latent as a constraint if in anchor mode
-        # (SetNode "anchor_samples" — mirrors SVI-Pro-Workflow.json nodes [169/295])
-        # NOTE: In SVI-Pro-Workflow.json, anchor_samples feeds WanImageToVideoSVIPro —
-        # a Wan2.2-only node with no direct LTX-2 equivalent.
-        # For LTX-2 the closest approximation is to use the anchor latent AS the
-        # initial video latent (replacing the empty latent) so the sampler starts
-        # from the character's encoded appearance rather than pure noise.
-        _vid_lat_input = get_value_at_index(vid_lat, 0)
-        if anchor_latent is not None:
-            try:
-                # Use anchor_latent as the starting video latent for Pass 1.
-                # This biases the denoising toward the character's appearance.
-                # (The anchor replaces the empty latent — it is a valid LATENT dict.)
-                _vid_lat_input = anchor_latent
-                print(f"   ✓ Character anchor injected as video latent seed  (mode={_char_mode})")
-                print(f"     Note: LTX-2 has no WanImageToVideoSVIPro equivalent;")
-                print(f"     anchor is used as the initial latent for Pass 1 denoising.")
+        # Calculate latent dimensions: half resolution
+        latent_w = max(1, resized_w // 2)
+        latent_h = max(1, resized_h // 2)
 
-                # Diagnostic: check tensor rank (LTX video VAE should produce T dim)
-                _anch_shape = anchor_latent.get("samples", torch.empty(0)).shape
-                print(f"     Anchor latent shape: {list(_anch_shape)}")
-                if len(_anch_shape) == 4:
-                    # Standard VAEEncode returns 4D (N, C, H, W); LTX needs 5D (N, C, T, H, W)
-                    # Unsqueeze temporal dimension (T=1) to make it a single-frame video latent
-                    print("     ⚠️  Anchor is 4D (image latent) — unsqueezing T dim for video latent.")
-                    _s = anchor_latent["samples"].unsqueeze(2)   # → (N, C, 1, H, W)
-                    _vid_lat_input = {**anchor_latent, "samples": _s}
-                    print(f"     Anchor latent shape after fix: {list(_s.shape)}")
-            except Exception as e:
-                print(f"   ⚠️  Anchor injection error ({e}) — using empty/I2V latent.")
-                _vid_lat_input = get_value_at_index(vid_lat, 0)
-
-        # [199] LTXVEmptyLatentAudio — audio latent
-        elalat  = NODE_CLASS_MAPPINGS["LTXVEmptyLatentAudio"]()
-        aud_lat = elalat.EXECUTE_NORMALIZED(
-            frames_number=frames, frame_rate=fps, batch_size=1,
-            audio_vae=vae_audio)
-
-        # [109] LTXVConcatAVLatent — combine video + audio latents
-        catav           = NODE_CLASS_MAPPINGS["LTXVConcatAVLatent"]()
-        av_lat1         = catav.EXECUTE_NORMALIZED(
-            video_latent=_vid_lat_input,
-            audio_latent=get_value_at_index(aud_lat, 0))
-        combined_latent = get_value_at_index(av_lat1, 0)
+        # Create empty video latent at half resolution
+        emptyltxvlatentvideo_result = emptyltxvlatentvideo.EXECUTE_NORMALIZED(
+            width=latent_w,
+            height=latent_h,
+            length=frames,
+            batch_size=1,
+        )
 
         # ══════════════════════════════════════════════════════════════════
-        # PHASE 5 — SIGMA SCHEDULE
+        # STEP 9: I2V conditioning (LTXVImgToVideoInplace) if image provided
         # ══════════════════════════════════════════════════════════════════
+        ltxvimgtovideoinplace = NODE_CLASS_MAPPINGS["LTXVImgToVideoInplace"]()
 
-        manualsigmas   = NODE_CLASS_MAPPINGS["ManualSigmas"]()
+        if not img_bypass:
+            vid_lat_conditioned = ltxvimgtovideoinplace.EXECUTE_NORMALIZED(
+                strength=img_str,
+                bypass=False,
+                vae=vae_video,
+                image=pp_img,
+                latent=get_value_at_index(emptyltxvlatentvideo_result, 0),
+            )
+            vid_lat = get_value_at_index(vid_lat_conditioned, 0)
+        else:
+            vid_lat = get_value_at_index(emptyltxvlatentvideo_result, 0)
+
+        # ══════════════════════════════════════════════════════════════════
+        # STEP 10: Audio latent + concat AV
+        # ══════════════════════════════════════════════════════════════════
+        ltxvemptylatentaudio = NODE_CLASS_MAPPINGS["LTXVEmptyLatentAudio"]()
+        ltxvemptylatentaudio_result = ltxvemptylatentaudio.EXECUTE_NORMALIZED(
+            frames_number=frames,
+            frame_rate=fps,
+            batch_size=1,
+            audio_vae=vae_audio,
+        )
+
+        ltxvconcatavlatent = NODE_CLASS_MAPPINGS["LTXVConcatAVLatent"]()
+        av_lat = get_value_at_index(ltxvconcatavlatent.EXECUTE_NORMALIZED(
+            video_latent=vid_lat,
+            audio_latent=get_value_at_index(ltxvemptylatentaudio_result, 0),
+        ), 0)
+
+        # ══════════════════════════════════════════════════════════════════
+        # STEP 11: Pass 1 (euler + ManualSigmas)
+        # ══════════════════════════════════════════════════════════════════
+        print("   [Clip] Pass 1...")
+        manualsigmas = NODE_CLASS_MAPPINGS["ManualSigmas"]()
         ksamplerselect = NODE_CLASS_MAPPINGS["KSamplerSelect"]()
-        randomnoise    = NODE_CLASS_MAPPINGS["RandomNoise"]()
-        cfgguider      = NODE_CLASS_MAPPINGS["CFGGuider"]()
-        sca            = NODE_CLASS_MAPPINGS["SamplerCustomAdvanced"]()
+        randomnoise = NODE_CLASS_MAPPINGS["RandomNoise"]()
+        cfgguider = NODE_CLASS_MAPPINGS["CFGGuider"]()
+        samplercustomadvanced = NODE_CLASS_MAPPINGS["SamplerCustomAdvanced"]()
 
-        sig_p1_high = None   # used for PRO mode pass 1 (sigmas_high)
-        sig_p2_low  = None   # used for PRO mode pass 2 (sigmas_low)
-
-        if pro_mode:
-            print(f"\n⚙️  PRO sigma schedule — BasicScheduler steps={pro_steps} "
-                  f"sched={pro_scheduler} split@{pro_split_at}")
-            print("   ⚠️  EXPERIMENTAL: SVI-Pro sigma chain was designed for Wan2.2.")
-            print("      ModelSamplingSD3 applies SD3 cosine flow parameterisation.")
-            print("      LTX-2 GGUF uses a different flow schedule — output quality")
-            print("      may vary. Use ManualSigmas mode (PRO_MODE=False) if results")
-            print("      are degraded or distorted.")
-            try:
-                # [ModelSamplingSD3] shift=8 — sigma rescaling for flow matching
-                # From SVI-Pro-Workflow.json sigma scheduling approach
-                ms3  = NODE_CLASS_MAPPINGS["ModelSamplingSD3"]()
-                unet_sampled = get_value_at_index(
-                    ms3.patch(model=unet, shift=8.0), 0)
-
-                # [BasicScheduler] — generates full sigma schedule
-                bs   = NODE_CLASS_MAPPINGS["BasicScheduler"]()
-                sigs = get_value_at_index(
-                    bs.get_sigmas(
-                        model=unet_sampled,
-                        scheduler=pro_scheduler,
-                        steps=pro_steps,
-                        denoise=1.0), 0)
-
-                # [SplitSigmas] — splits into high and low sigma passes
-                # step_index=pro_split_at divides the schedule at that step
-                ss         = NODE_CLASS_MAPPINGS["SplitSigmas"]()
-                split_out  = ss.get_sigmas(sigmas=sigs, step=pro_split_at)
-                sig_p1_high = get_value_at_index(split_out, 0)  # sigmas_high
-                sig_p2_low  = get_value_at_index(split_out, 1)  # sigmas_low
-
-                # Use patched model for sampling
-                unet = unet_sampled
-
-                # KSamplerSelect euler — sampler for both passes in PRO mode
-                sampler_p1 = ksamplerselect.EXECUTE_NORMALIZED(sampler_name="euler")
-                sampler_p2 = sampler_p1   # reuse for pass 2 in PRO mode
-
-                print(f"   ✓ PRO sigmas computed (ModelSamplingSD3 + BasicScheduler + SplitSigmas)")
-
-            except KeyError as e:
-                print(f"   ⚠️  PRO mode node missing: {e} — falling back to ManualSigmas.")
-                pro_mode   = False
-            except Exception as e:
-                print(f"   ⚠️  PRO schedule failed ({e}) — falling back to ManualSigmas.")
-                pro_mode   = False
-
-        if not pro_mode:
-            print(f"\n⚙️  Standard sigma schedule — Pass1: {pass1_sigmas[:45]}…")
-            sig_p1_high = get_value_at_index(
-                manualsigmas.EXECUTE_NORMALIZED(sigmas=pass1_sigmas), 0)
-            sampler_p1  = ksamplerselect.EXECUTE_NORMALIZED(sampler_name=pass1_sampler)
-            sig_p2_low  = get_value_at_index(
-                manualsigmas.EXECUTE_NORMALIZED(sigmas=pass2_sigmas), 0)
-            sampler_p2  = ksamplerselect.EXECUTE_NORMALIZED(sampler_name=pass2_sampler)
-
-        # ══════════════════════════════════════════════════════════════════
-        # PHASE 6 — PASS 1 (first-pass denoising)
-        # ══════════════════════════════════════════════════════════════════
-
-        print(f"\n🚀 Pass 1 — denoising…")
-        _print_vram()
-
-        noise_p1  = randomnoise.EXECUTE_NORMALIZED(noise_seed=seed)
-        guider_p1 = cfgguider.EXECUTE_NORMALIZED(
+        cfgguider_p1 = cfgguider.EXECUTE_NORMALIZED(
             cfg=pass1_cfg,
             model=unet,
-            positive=get_value_at_index(cond, 0),
-            negative=get_value_at_index(cond, 1))
+            positive=get_value_at_index(ltxvconditioning_result, 0),
+            negative=get_value_at_index(ltxvconditioning_result, 1),
+        )
 
-        try:
-            out1 = sca.EXECUTE_NORMALIZED(
-                noise=get_value_at_index(noise_p1, 0),
-                guider=get_value_at_index(guider_p1, 0),
-                sampler=get_value_at_index(sampler_p1, 0),
-                sigmas=sig_p1_high,
-                latent_image=combined_latent)
-            p1_av = get_value_at_index(out1, 0)  # raw AV output → Pass 2
-        except Exception as e:
-            raise RuntimeError(
-                f"Pass 1 sampling failed: {e}\n"
-                "  Fix: If you see 'deformed output', try a different SEED.\n"
-                "  Three consecutive deformations → change USER_INPUT/POSITIVE_PROMPT."
-            )
+        samplercustomadvanced_p1 = samplercustomadvanced.EXECUTE_NORMALIZED(
+            noise=get_value_at_index(randomnoise.EXECUTE_NORMALIZED(noise_seed=seed), 0),
+            guider=get_value_at_index(cfgguider_p1, 0),
+            sampler=get_value_at_index(ksamplerselect.EXECUTE_NORMALIZED(sampler_name=pass1_sampler), 0),
+            sigmas=get_value_at_index(manualsigmas.EXECUTE_NORMALIZED(sigmas=pass1_sigmas), 0),
+            latent_image=av_lat,
+        )
 
-        del guider_p1
-        cleanup_memory()
-        print("   ✓ Pass 1 complete")
+        del cfgguider_p1
+        torch.cuda.empty_cache()
+        gc.collect()
+        print("   [Clip] Pass 1 done")
 
         # ══════════════════════════════════════════════════════════════════
-        # PHASE 7 — PASS 2 (spatial upscale + refinement)
+        # STEP 12: Separate AV + CropGuides + CFGGuider for Pass 2
         # ══════════════════════════════════════════════════════════════════
+        ltxvseparateavlatent = NODE_CLASS_MAPPINGS["LTXVSeparateAVLatent"]()
+        ltxvseparateavlatent_p1 = ltxvseparateavlatent.EXECUTE_NORMALIZED(
+            av_latent=get_value_at_index(samplercustomadvanced_p1, 0)
+        )
 
-        print(f"\n🔧 Pass 2 — upscale + refinement…")
-        _print_vram()
+        ltxvcropguides = NODE_CLASS_MAPPINGS["LTXVCropGuides"]()
+        ltxvcropguides_result = ltxvcropguides.EXECUTE_NORMALIZED(
+            positive=get_value_at_index(ltxvconditioning_result, 0),
+            negative=get_value_at_index(ltxvconditioning_result, 1),
+            latent=get_value_at_index(ltxvseparateavlatent_p1, 0),
+        )
 
-        # [LTXVSeparateAVLatent] — split P1 AV → video + audio
-        ltxvsep    = NODE_CLASS_MAPPINGS["LTXVSeparateAVLatent"]()
-        s1         = ltxvsep.EXECUTE_NORMALIZED(av_latent=p1_av)
-        vid_lat_p1 = get_value_at_index(s1, 0)
-        aud_lat_p1 = get_value_at_index(s1, 1)
-
-        # [LTXVCropGuides] — trim conditioning to match upscaled latent dims
-        ltxvcrop = NODE_CLASS_MAPPINGS["LTXVCropGuides"]()
-        cropped  = ltxvcrop.EXECUTE_NORMALIZED(
-            positive=get_value_at_index(cond, 0),
-            negative=get_value_at_index(cond, 1),
-            latent=vid_lat_p1)
-        # cropped[0]=positive, [1]=negative, [2]=cropped_video_lat
-
-        # CFGGuider for Pass 2 with cropped conditioning
-        guider_p2 = cfgguider.EXECUTE_NORMALIZED(
+        cfgguider_p2 = cfgguider.EXECUTE_NORMALIZED(
             cfg=pass2_cfg,
             model=unet,
-            positive=get_value_at_index(cropped, 0),
-            negative=get_value_at_index(cropped, 1))
+            positive=get_value_at_index(ltxvcropguides_result, 0),
+            negative=get_value_at_index(ltxvcropguides_result, 1),
+        )
 
-        # [LTXVLatentUpsampler] [118] — 2× spatial upsample
-        ltxvup    = NODE_CLASS_MAPPINGS["LTXVLatentUpsampler"]()
-        upsampled = ltxvup.upsample_latent(
-            samples=get_value_at_index(cropped, 2),
-            upscale_model=upscale_model,
-            vae=vae_video)
-        del upscale_model
-        cleanup_memory()
+        # ══════════════════════════════════════════════════════════════════
+        # STEP 13: LTXVLatentUpsampler (spatial x2)
+        # ══════════════════════════════════════════════════════════════════
+        ltxvlatentupsampler = NODE_CLASS_MAPPINGS["LTXVLatentUpsampler"]()
+        ltxvlatentupsampler_result = ltxvlatentupsampler.upsample_latent(
+            samples=get_value_at_index(ltxvcropguides_result, 2),
+            upscale_model=upscale_mdl,
+            vae=vae_video,
+        )
 
-        # [LTXVConcatAVLatent] [117] — upsampled video + audio
-        av_lat2 = catav.EXECUTE_NORMALIZED(
-            video_latent=get_value_at_index(upsampled, 0),
-            audio_latent=aud_lat_p1)
+        del upscale_mdl
+        torch.cuda.empty_cache()
+        gc.collect()
 
-        noise_p2 = randomnoise.EXECUTE_NORMALIZED(noise_seed=pass2_seed)
-
-        try:
-            out2 = sca.EXECUTE_NORMALIZED(
-                noise=get_value_at_index(noise_p2, 0),
-                guider=get_value_at_index(guider_p2, 0),
-                sampler=get_value_at_index(sampler_p2, 0),
-                sigmas=sig_p2_low,
-                latent_image=get_value_at_index(av_lat2, 0))
-            p2_denoised = get_value_at_index(out2, 1)  # denoised_output slot
-        except Exception as e:
-            raise RuntimeError(
-                f"Pass 2 sampling failed: {e}\n"
-                "  Fix: Try reducing TILED_SPATIAL_TILES or USE_TILED_VAE=False."
+        # I2V re-apply on upsampled latent
+        if not img_bypass:
+            upsampled_conditioned = ltxvimgtovideoinplace.EXECUTE_NORMALIZED(
+                strength=img_str,
+                bypass=False,
+                vae=vae_video,
+                image=pp_img,
+                latent=get_value_at_index(ltxvlatentupsampler_result, 0),
             )
-
-        del guider_p2, unet
-        cleanup_memory()
-        print("   ✓ Pass 2 complete")
+            av_lat2 = get_value_at_index(ltxvconcatavlatent.EXECUTE_NORMALIZED(
+                video_latent=get_value_at_index(upsampled_conditioned, 0),
+                audio_latent=get_value_at_index(ltxvseparateavlatent_p1, 1),
+            ), 0)
+        else:
+            av_lat2 = get_value_at_index(ltxvconcatavlatent.EXECUTE_NORMALIZED(
+                video_latent=get_value_at_index(ltxvlatentupsampler_result, 0),
+                audio_latent=get_value_at_index(ltxvseparateavlatent_p1, 1),
+            ), 0)
 
         # ══════════════════════════════════════════════════════════════════
-        # PHASE 8 — DECODE
+        # STEP 14: Pass 2 (gradient_estimation + ManualSigmas)
         # ══════════════════════════════════════════════════════════════════
+        print("   [Clip] Pass 2...")
+        samplercustomadvanced_p2 = samplercustomadvanced.EXECUTE_NORMALIZED(
+            noise=get_value_at_index(randomnoise.EXECUTE_NORMALIZED(noise_seed=pass2_seed), 0),
+            guider=get_value_at_index(cfgguider_p2, 0),
+            sampler=get_value_at_index(ksamplerselect.EXECUTE_NORMALIZED(sampler_name=pass2_sampler), 0),
+            sigmas=get_value_at_index(manualsigmas.EXECUTE_NORMALIZED(sigmas=pass2_sigmas), 0),
+            latent_image=av_lat2,
+        )
 
-        print("\n🎞️  Decoding video & audio…")
-        _print_vram()
+        # ══════════════════════════════════════════════════════════════════
+        # STEP 15: DELETE UNet (free VRAM for decode)
+        # ══════════════════════════════════════════════════════════════════
+        del cfgguider_p2, unet
+        torch.cuda.empty_cache()
+        gc.collect()
+        print("   [Clip] UNet deleted, Pass 2 done")
 
-        # [LTXVSeparateAVLatent] [125] — final split
-        s2          = ltxvsep.EXECUTE_NORMALIZED(av_latent=p2_denoised)
-        vid_lat_fin = get_value_at_index(s2, 0)
-        aud_lat_fin = get_value_at_index(s2, 1)
+        # ══════════════════════════════════════════════════════════════════
+        # STEP 16: Decode video (tiled or standard VAEDecode)
+        # ══════════════════════════════════════════════════════════════════
+        ltxvseparateavlatent_p2 = ltxvseparateavlatent.EXECUTE_NORMALIZED(
+            av_latent=get_value_at_index(samplercustomadvanced_p2, 1)
+        )
 
-        # ── Video decode ───────────────────────────────────────────────────
-        decoded_frames = None
+        video_latent_final = get_value_at_index(ltxvseparateavlatent_p2, 0)
+        audio_latent_final = get_value_at_index(ltxvseparateavlatent_p2, 1)
+
+        decoded_video = None
         if use_tiled_vae:
-            # [265] LTXVSpatioTemporalTiledVAEDecode — ComfyUI-LTXVideo
-            # VRAM-efficient tiled spatiotemporal decode
             try:
-                tiled_dec = NODE_CLASS_MAPPINGS["LTXVSpatioTemporalTiledVAEDecode"]()
-                decoded_frames = get_value_at_index(
-                    tiled_dec.EXECUTE_NORMALIZED(
-                        vae=vae_video,
-                        latents=vid_lat_fin,
-                        spatial_tiles=tiled_spatial_tiles,
-                        spatial_overlap=tiled_spatial_overlap,
-                        temporal_tile_length=tiled_temporal_len,
-                        temporal_overlap=tiled_temporal_overlap,
-                        last_frame_fix=tiled_last_frame_fix,
-                        working_device="auto",
-                        working_dtype="auto"), 0)
-                print("   ✓ Tiled VAE decode (LTXVSpatioTemporalTiledVAEDecode)")
+                tiled_decode = NODE_CLASS_MAPPINGS["LTXVSpatioTemporalTiledVAEDecode"]()
+                decoded_video = get_value_at_index(tiled_decode.EXECUTE_NORMALIZED(
+                    vae=vae_video, latents=video_latent_final,
+                    spatial_tiles=tiled_stiles, spatial_overlap=tiled_soverlap,
+                    temporal_tile_length=tiled_tlen, temporal_overlap=tiled_toverlap,
+                    last_frame_fix=False, working_device="auto", working_dtype="auto"), 0)
+                print("   [Clip] Tiled VAE decode done")
             except (KeyError, Exception) as e:
-                print(f"   ⚠️  Tiled VAE unavailable ({type(e).__name__}: {e})")
-                print("      Falling back to standard VAEDecode.")
-                print("      Fix: Clone ComfyUI-LTXVideo in Cell 1, or set USE_TILED_VAE=False.")
+                print(f"   [Clip] Tiled VAE skipped ({type(e).__name__}) - standard decode")
                 use_tiled_vae = False
 
-        if not use_tiled_vae or decoded_frames is None:
-            # Standard VAEDecode — always available in ComfyUI core
+        if not use_tiled_vae or decoded_video is None:
             vaedecode = NODE_CLASS_MAPPINGS["VAEDecode"]()
-            decoded_frames = get_value_at_index(
-                vaedecode.decode(samples=vid_lat_fin, vae=vae_video), 0)
-            print("   ✓ Standard VAE decode (VAEDecode)")
+            decoded_video = get_value_at_index(
+                vaedecode.decode(samples=video_latent_final, vae=vae_video), 0)
 
         del vae_video
-        cleanup_memory()
+        torch.cuda.empty_cache()
+        gc.collect()
 
-        # ── Audio decode [201] ─────────────────────────────────────────────
-        # [201] LTXVAudioVAEDecode — decode audio latent
-        try:
-            aud_dec   = NODE_CLASS_MAPPINGS["LTXVAudioVAEDecode"]()
-            audio_out = aud_dec.EXECUTE_NORMALIZED(
-                samples=aud_lat_fin,
-                audio_vae=vae_audio)
-        except Exception as e:
-            print(f"   ⚠️  Audio decode failed ({e}) — proceeding without audio.")
-            audio_out = None
+        # ══════════════════════════════════════════════════════════════════
+        # STEP 17: Decode audio (LTXVAudioVAEDecode)
+        # ══════════════════════════════════════════════════════════════════
+        ltxvaudiovaedecode = NODE_CLASS_MAPPINGS["LTXVAudioVAEDecode"]()
+        decoded_audio = ltxvaudiovaedecode.EXECUTE_NORMALIZED(
+            samples=audio_latent_final,
+            audio_vae=vae_audio,
+        )
 
+        # ══════════════════════════════════════════════════════════════════
+        # STEP 18: Delete VAEs
+        # ══════════════════════════════════════════════════════════════════
         del vae_audio
-        cleanup_memory()
+        torch.cuda.empty_cache()
+        gc.collect()
 
         # ══════════════════════════════════════════════════════════════════
-        # PHASE 9 — SAVE  (VHS_VideoCombine preferred, CreateVideo fallback)
+        # STEP 19: CreateVideo + save
         # ══════════════════════════════════════════════════════════════════
+        print("   [Clip] Creating video...")
+        createvideo = NODE_CLASS_MAPPINGS["CreateVideo"]()
+        createvideo_result = createvideo.EXECUTE_NORMALIZED(
+            fps=fps,
+            images=decoded_video,
+            audio=get_value_at_index(decoded_audio, 0),
+        )
 
-        print("\n💾 Saving video…")
-        _print_vram()
-        output_path = None
-
-        # Build output filename with character name for tracking
-        _prefix = output_prefix
-        if character_name and character_name != "Character":
-            _prefix = f"{output_prefix}-{character_name}"
-
-        # ── Try VHS_VideoCombine first ────────────────────────────────────
-        # [319/391/317] VHS_VideoCombine from SVI-Pro-Workflow.json
-        # format=video/h264-mp4, pix_fmt=yuv420p, crf=19 (matches original workflow)
-        if "VHS_VideoCombine" in NODE_CLASS_MAPPINGS and audio_out is not None:
-            try:
-                vhs  = NODE_CLASS_MAPPINGS["VHS_VideoCombine"]()
-                _audio_data = get_value_at_index(audio_out, 0)
-
-                vhs_out = vhs.combine_video(
-                    images=decoded_frames,
-                    frame_rate=fps,
-                    loop_count=0,
-                    filename_prefix=_prefix,
-                    format="video/h264-mp4",
-                    pix_fmt="yuv420p",
-                    crf=19,
-                    save_metadata=True,
-                    trim_to_audio=False,
-                    pingpong=False,
-                    save_output=True,
-                    audio=_audio_data,
-                )
-                # VHS_VideoCombine returns VHS_FILENAMES — extract path.
-                # VideoHelperSuite 1.7.9 uses video_paths (plural); older builds
-                # use video_path (singular). Try both, then list/tuple fallback.
-                _fnames = get_value_at_index(vhs_out, 0)
-                if hasattr(_fnames, "video_paths") and _fnames.video_paths:
-                    output_path = _fnames.video_paths[0]
-                elif hasattr(_fnames, "video_path"):
-                    output_path = _fnames.video_path
-                elif isinstance(_fnames, (list, tuple)) and len(_fnames) > 0:
-                    output_path = _fnames[0]
-                else:
-                    print(f"   ⚠️  VHS_FILENAMES type={type(_fnames)} — "
-                          f"cannot extract path, falling back to CreateVideo.")
-                    output_path = None
-                if output_path:
-                    print(f"   ✓ Saved via VHS_VideoCombine (h264-mp4, crf=19, yuv420p)")
-
-            except Exception as e:
-                print(f"   ⚠️  VHS_VideoCombine failed ({e}) — using CreateVideo fallback.")
-                output_path = None
-
-        # ── Fallback: CreateVideo ─────────────────────────────────────────
-        if output_path is None:
-            try:
-                createvideo = NODE_CLASS_MAPPINGS["CreateVideo"]()
-                _aud_arg    = get_value_at_index(audio_out, 0) if audio_out else None
-                if _aud_arg is not None:
-                    vid_obj = createvideo.EXECUTE_NORMALIZED(
-                        fps=fps, images=decoded_frames, audio=_aud_arg)
-                else:
-                    vid_obj = createvideo.EXECUTE_NORMALIZED(
-                        fps=fps, images=decoded_frames)
-                output_path = save_video_from_components(
-                    get_value_at_index(vid_obj, 0), prefix=_prefix)
-                print(f"   ✓ Saved via CreateVideo fallback")
-            except Exception as e:
-                raise RuntimeError(
-                    f"Video save failed: {e}\n"
-                    "  Fix: Check /content/ComfyUI/output/ permissions.\n"
-                    "  Also try: VHS_VideoCombine node may need ComfyUI-VideoHelperSuite."
-                )
-
-    # ── Timing ────────────────────────────────────────────────────────────
-    elapsed = time.time() - t0
-    mins, secs = divmod(int(elapsed), 60)
-
-    # ── Metadata JSON sidecar ─────────────────────────────────────────────
-    _active_loras = [s["lora"] for s in _lora_stack if s.get("on")]
-    meta = {
-        "seed"              : seed,
-        "width"             : width,
-        "height"            : height,
-        "frames"            : frames,
-        "fps"               : fps,
-        "positive_prompt"   : final_positive,
-        "negative_prompt"   : final_negative,
-        "user_input"        : user_input,
-        "image_path"        : image_path,
-        "character_image"   : character_image_path,
-        "character_mode"    : _char_mode,
-        "character_name"    : character_name,
-        "character_strength": character_strength,
-        "pro_mode"          : pro_mode,
-        "pro_steps"         : pro_steps if pro_mode else None,
-        "pro_scheduler"     : pro_scheduler if pro_mode else None,
-        "loras"             : _active_loras,
-        "unet_model"        : UNET_MODEL,
-        "elapsed_seconds"   : elapsed,
-        "output_path"       : output_path,
-    }
-    if output_path:
-        save_metadata_sidecar(output_path, meta)
-
-    print(f"\n✅ Done in {mins}m {secs}s")
-    print(f"   📁 {output_path}")
-    _print_vram()
-
-    # ── Preview & download ─────────────────────────────────────────────────
-    if SHOW_PREVIEWS and output_path:
-        print("\n▶ Preview:")
-        display_video(output_path)
-
-    if DOWNLOAD_AFTER_GENERATE and output_path:
-        print("   ⬇️  Auto-downloading…")
-        try:
-            files.download(output_path)
-        except Exception as e:
-            print(f"   ⚠️  Download failed ({e}) — file is at {output_path}")
-
-    return output_path
+        video_obj = get_value_at_index(createvideo_result, 0)
+        output_path = save_video_from_components(video_obj, prefix=output_prefix)
+        print(f"   [Clip] Saved: {output_path}")
+        return output_path
 
 
-print("✅ generate_pro() defined — run Cell 9 to generate.")
-print("   Signature: generate_pro(user_input, image_path, width, height, frames, …)")
+print("generate_clip() defined.")
+print("   VRAM strategy: CLIP -> encode -> DELETE CLIP -> load UNet -> LoRAs -> generate -> DELETE UNet -> decode")
+print("   Distilled LoRA (ltx-2.3-22b-distilled-lora-384.safetensors) applied FIRST, always.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CELL 8  ─  STORYBOARD / MULTI-SCENE RUNNER
+# CELL 8  ─  INFINITE FLOW ENGINE + STORYBOARD
 # ══════════════════════════════════════════════════════════════════════════════
 
 # @title  { "single-column": true }
-# @markdown ## 💥 8. Storyboard / Multi-Scene Runner
-# @markdown Edit the `SCENES` list below, then run Cell 9 with
-# @markdown `USE_STORYBOARD = True` to generate all scenes sequentially.
-# @markdown
-# @markdown When `USE_SCENE_CONTINUITY = True` the last frame of scene N
-# @markdown is automatically extracted and used as the seed image for scene N+1,
-# @markdown creating seamless shot-to-shot character continuity.
+# @markdown ## 8. InfiniteFlowEngine + Storyboard Runner
+# @markdown 12-scene orchestrator with last-frame chaining + rolling context.
 
-# ── Example storyboard — edit or extend ──────────────────────────────────────
-SCENES = [
-    {
-        "user_input"    : "a woman enters a dimly lit café, shaking rain from her coat, looks around",
-        "image_path"    : CHARACTER_IMAGE_PATH,   # use character image as first-frame seed
-        "frames"        : 97,
-        "seed"          : SEED,
-        "output_prefix" : f"Story01-{CHARACTER_NAME}",
-        "character_image_path": CHARACTER_IMAGE_PATH,
-        "character_mode": CHARACTER_CONSISTENCY_MODE,
-    },
-    {
-        "user_input"    : "she sits at a window table, wraps her hands around a coffee cup, "
-                          "gazes out at the rain-streaked street",
-        "image_path"    : None,   # will be filled by continuity system
-        "frames"        : 121,
-        "seed"          : SEED + 1,
-        "output_prefix" : f"Story02-{CHARACTER_NAME}",
-        "character_image_path": CHARACTER_IMAGE_PATH,
-        "character_mode": CHARACTER_CONSISTENCY_MODE,
-    },
-    {
-        "user_input"    : "she notices something outside and leans forward, face half lit by neon glow",
-        "image_path"    : None,   # filled by continuity from scene 2
-        "frames"        : 97,
-        "seed"          : SEED + 2,
-        "output_prefix" : f"Story03-{CHARACTER_NAME}",
-        "character_image_path": CHARACTER_IMAGE_PATH,
-        "character_mode": CHARACTER_CONSISTENCY_MODE,
-    },
-]
+class InfiniteFlowEngine:
+    """
+    Generates a sequence of clips where:
+      1. VisionDescribeEngine analyses the current seed/last frame
+      2. EasyPromptEngine expands the story beat into a cinematic prompt,
+         injecting the CharacterBible as a hard consistency lock
+      3. generate_clip() renders the clip with the two-pass LTX-2.3 pipeline
+      4. get_last_frame_tensor() extracts the last frame for the next beat
+      5. All clips are saved and can be concatenated
 
-USE_STORYBOARD = False  # @param {type:"boolean"}
-# Set True in Cell 9 to run all scenes instead of a single clip.
+    Every heavyweight model is loaded -> used -> unloaded in strict sequence.
+    """
 
+    def __init__(
+        self,
+        character_bible: Optional[CharacterBible] = None,
+        llm_model: str = "8B",
+        vision_model: str = "3B-fast",
+        width: int = 832,
+        height: int = 480,
+        frames: int = 121,
+        fps: int = 25,
+        image_strength: float = 1.0,
+        creativity: float = 0.9,
+        lora_triggers: str = "",
+        use_vision: bool = True,
+        use_tiled_vae: bool = True,
+        offline: bool = False,
+        output_dir: str = "/content/ComfyUI/output/infinite_flow",
+        show_previews: bool = True,
+    ):
+        self.bible = character_bible or CharacterBible()
+        self.llm_model = llm_model
+        self.vision_model = vision_model
+        self.width = width
+        self.height = height
+        self.frames = frames
+        self.fps = fps
+        self.img_strength = image_strength
+        self.creativity = creativity
+        self.lora_triggers = lora_triggers
+        self.use_vision = use_vision
+        self.use_tiled_vae = use_tiled_vae
+        self.offline = offline
+        self.output_dir = output_dir
+        self.show_previews = show_previews
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+
+        self._vision_engine = VisionDescribeEngine(vision_model, offline)
+        self._prompt_engine = EasyPromptEngine(llm_model, offline, keep_loaded=False)
+
+        self._clip_paths: List[str] = []
+        self._scene_history: List[str] = []
+
+    def _rolling_ctx(self) -> str:
+        return "\n".join(self._scene_history[-2:])
+
+    def _process_beat(self, beat: str, current_image: Optional[torch.Tensor],
+                      beat_idx: int, base_seed: int) -> tuple:
+        beat_seed = base_seed + (beat_idx - 1) * 1000
+
+        if beat_idx > 1 and current_image is not None and self.use_vision:
+            print(f"   [Beat {beat_idx}] Vision Describe...")
+            scene_ctx = self._vision_engine.describe(current_image)
+            cleanup_memory()
+        else:
+            scene_ctx = self._rolling_ctx()
+
+        print(f"   [Beat {beat_idx}] EasyPrompt expand...")
+        prompt, neg = self._prompt_engine.generate(
+            user_input=beat,
+            frame_count=self.frames,
+            creativity=self.creativity,
+            seed=beat_seed,
+            scene_context=scene_ctx,
+            lora_triggers=self.lora_triggers,
+            character_bible=self.bible.to_prompt_block(),
+        )
+        cleanup_memory()
+
+        self._scene_history.append(prompt[:400])
+        if len(self._scene_history) > 2:
+            self._scene_history = self._scene_history[-2:]
+
+        return prompt, neg, beat_seed
+
+    def run(
+        self,
+        story_beats: List[str],
+        seed_image_path: Optional[str] = None,
+        base_seed: int = 42,
+    ) -> List[str]:
+        """
+        Process each beat in story_beats.
+        Returns list of output .mp4 paths (one per beat).
+        """
+        current_image: Optional[torch.Tensor] = None
+
+        if seed_image_path and os.path.exists(seed_image_path):
+            current_image = load_image_tensor(seed_image_path)
+            print(f"[IFE] Seed image loaded: {seed_image_path}")
+
+            if not self.bible.has_characters() and self.use_vision:
+                print("[IFE] Extracting Character Bible from seed image...")
+                desc = self._vision_engine.describe(current_image)
+                cleanup_memory()
+                self.bible.extract_from_description("Main Character", desc)
+                self._scene_history.append(desc)
+                print(f"[IFE] Bible set: {desc[:200]}...")
+
+        print(f"\n[IFE] === INFINITE FLOW ENGINE ===")
+        print(f"[IFE]  Beats    : {len(story_beats)}")
+        print(f"[IFE]  Size     : {self.width}x{self.height}  {self.frames}f @ {self.fps}fps")
+        print(f"[IFE]  LLM      : {self.llm_model}  Vision: {self.vision_model}")
+        print(f"[IFE]  Bible    : {self.bible.names() or 'empty (T2V)'}")
+        print(f"[IFE]  Mode     : {'I2V' if current_image is not None else 'T2V'}\n")
+
+        for beat_idx, beat in enumerate(story_beats, 1):
+            print(f"\n[IFE] -- Beat {beat_idx}/{len(story_beats)} --")
+            print(f"[IFE]   {beat[:80]}{'...' if len(beat) > 80 else ''}")
+
+            prompt, neg, beat_seed = self._process_beat(
+                beat, current_image, beat_idx, base_seed)
+
+            print(f"\n  EXPANDED ({len(prompt.split())}w): {prompt[:200]}...")
+            print(f"  NEG: {neg[:100]}...\n")
+
+            try:
+                clip_path = generate_clip(
+                    image_tensor=current_image,
+                    prompt=prompt,
+                    neg_prompt=neg,
+                    width=self.width,
+                    height=self.height,
+                    frames=self.frames,
+                    fps=self.fps,
+                    seed=beat_seed,
+                    image_strength=self.img_strength,
+                    use_tiled_vae=self.use_tiled_vae,
+                    output_prefix=f"IFE_{beat_idx:03d}",
+                )
+            except torch.cuda.OutOfMemoryError:
+                cleanup_memory()
+                print(f"   OOM on beat {beat_idx}. Retrying T2V...")
+                clip_path = generate_clip(
+                    image_tensor=None,
+                    prompt=prompt,
+                    neg_prompt=neg,
+                    width=self.width,
+                    height=self.height,
+                    frames=self.frames,
+                    fps=self.fps,
+                    seed=beat_seed + 1,
+                    use_tiled_vae=False,
+                    output_prefix=f"IFE_{beat_idx:03d}_retry",
+                )
+
+            dest = os.path.join(self.output_dir, f"scene_{beat_idx:03d}.mp4")
+            shutil.copy2(clip_path, dest)
+            self._clip_paths.append(dest)
+            print(f"\n[IFE] Beat {beat_idx} -> {dest}")
+
+            last_frame = get_last_frame_tensor(dest)
+            current_image = last_frame if last_frame is not None else None
+            if last_frame is not None:
+                print(f"[IFE]    Last frame extracted for beat {beat_idx + 1}.")
+            else:
+                print(f"[IFE]    No last frame - next beat will be T2V.")
+
+            if self.show_previews:
+                display_video(dest)
+
+        print(f"\n[IFE] === {len(story_beats)} scenes complete ===")
+        print(f"[IFE]  Output dir: {self.output_dir}")
+        return self._clip_paths
+
+    def concat_all(self, output_name: str = "full_video.mp4") -> str:
+        """Concatenate all generated clips into one final video."""
+        out = os.path.join(self.output_dir, output_name)
+        return concatenate_clips(self._clip_paths, out)
+
+    def download_all(self):
+        for p in self._clip_paths:
+            if os.path.exists(p):
+                files.download(p)
+
+    def save_bible(self, path: str = "/content/character_bible.json"):
+        self.bible.save(path)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STORYBOARD RUNNER
+# ══════════════════════════════════════════════════════════════════════════════
 
 def run_storyboard(
-    scenes:          List[Dict],
-    use_continuity:  bool = USE_SCENE_CONTINUITY,
-    tmp_dir:         str  = "/content/ComfyUI/input",
-) -> List[Optional[str]]:
+    storyboard: List[dict],
+    seed_image_path: Optional[str] = None,
+    base_seed: int = 42,
+    output_dir: str = "/content/ComfyUI/output/storyboard",
+    show_previews: bool = True,
+) -> List[str]:
     """
-    Run a list of scenes sequentially, optionally chaining last-frame continuity.
+    Run a storyboard (list of dicts with 'prompt' key) through generate_clip()
+    with scene continuity (last frame -> next clip seed image).
 
-    Each scene dict supports these keys (all optional except user_input):
-      user_input           — story description for Easy Prompt
-      image_path           — seed image path (overridden by continuity if None)
-      frames               — frame count
-      seed                 — RNG seed
-      output_prefix        — filename prefix
-      width / height       — resolution (defaults to global WIDTH/HEIGHT)
-      character_image_path — character reference
-      character_mode       — 'i2v', 'anchor', 'both', 'none'
-      positive_prompt      — manual prompt (used if BYPASS_EASY_PROMPT=True)
-      negative_prompt      — manual negative
+    Each storyboard entry can optionally include:
+      - camera_lora: filename of camera LoRA to apply
+      - shot_data: dict with motion/camera metadata for adaptive strength
 
-    Returns list of output paths (None for failed scenes).
+    Returns list of output video paths.
     """
-    os.makedirs(tmp_dir, exist_ok=True)
-    outputs = []
-    prev_output = None
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    clip_paths = []
+    current_image = None
+    prev_shot_success = True
 
-    print("🎬 Storyboard Runner — Starting")
-    print(f"   Scenes    : {len(scenes)}")
-    print(f"   Continuity: {use_continuity}")
-    print("─" * 70)
+    if seed_image_path and os.path.exists(seed_image_path):
+        current_image = load_image_tensor(seed_image_path)
+        print(f"[Storyboard] Seed image loaded: {seed_image_path}")
 
-    for i, scene in enumerate(scenes):
-        scene_num = i + 1
-        print(f"\n🎬 Scene {scene_num}/{len(scenes)}: {scene.get('output_prefix','Scene')}")
-        print(f"   Input: {scene.get('user_input','')[:80]}…")
+    for idx, scene in enumerate(storyboard):
+        shot_prompt = scene.get("prompt", "")
+        camera_lora = scene.get("camera_lora", None)
+        shot_data = scene.get("shot_data", {})
+        prev_shot = scene.get("prev_shot", None)
 
-        # Resolve image_path: use continuity frame if available and not explicitly set
-        _image_path = scene.get("image_path")
-        if use_continuity and prev_output and _image_path is None:
-            print(f"   🔗 Continuity: extracting last frame from scene {scene_num - 1}…")
-            last_tensor = get_last_frame_tensor(prev_output)
-            if last_tensor is not None:
-                _cont_path = os.path.join(tmp_dir, f"_continuity_s{scene_num:02d}.jpg")
-                # Save last frame as JPEG for use as seed image
-                pil_frame = tensor_to_pil(last_tensor)
-                pil_frame.save(_cont_path, "JPEG", quality=95)
-                _image_path = _cont_path
-                print(f"   ✓ Continuity frame saved: {_cont_path}")
-            else:
-                print(f"   ⚠️  Could not extract last frame — skipping continuity.")
+        current_seed = base_seed + idx * 100
+
+        # Calculate adaptive image strength
+        if USE_ADAPTIVE_STRENGTH and idx > 0 and shot_data:
+            img_str = calculate_adaptive_strength(
+                shot_data, prev_shot, prev_shot_success,
+                ANCHOR_STRENGTH_HIGH, ANCHOR_STRENGTH_LOW)
+        else:
+            img_str = IMAGE_STRENGTH if current_image is not None else 0.0
+
+        print(f"\n[Storyboard] Shot {idx + 1}/{len(storyboard)} | seed={current_seed}")
+        print(f"   Prompt: {shot_prompt[:120]}...")
 
         try:
-            out = generate_pro(
-                user_input           = scene.get("user_input", USER_INPUT),
-                image_path           = _image_path,
-                positive_prompt      = scene.get("positive_prompt", POSITIVE_PROMPT),
-                negative_prompt      = scene.get("negative_prompt", NEGATIVE_PROMPT),
-                width                = scene.get("width", WIDTH),
-                height               = scene.get("height", HEIGHT),
-                frames               = scene.get("frames", FRAMES),
-                fps                  = scene.get("fps", FPS),
-                seed                 = scene.get("seed", SEED),
-                image_strength       = scene.get("image_strength", IMAGE_STRENGTH),
-                character_image_path = scene.get("character_image_path", CHARACTER_IMAGE_PATH),
-                character_strength   = scene.get("character_strength", CHARACTER_STRENGTH),
-                character_mode       = scene.get("character_mode", CHARACTER_CONSISTENCY_MODE),
-                character_name       = scene.get("character_name", CHARACTER_NAME),
-                character_description= scene.get("character_description", CHARACTER_DESCRIPTION),
-                output_prefix        = scene.get("output_prefix", OUTPUT_PREFIX),
+            clip_path = generate_clip(
+                image_tensor=current_image,
+                prompt=shot_prompt,
+                neg_prompt=build_negative_prompt_enhanced() if USE_NEGATIVE_PROMPT_EXPANSION else NEGATIVE_PROMPT,
+                width=WIDTH,
+                height=HEIGHT,
+                frames=FRAMES,
+                fps=FPS,
+                seed=current_seed,
+                image_strength=img_str,
+                camera_lora_file=camera_lora,
+                output_prefix=f"SB_{idx + 1:03d}",
             )
-            outputs.append(out)
-            prev_output = out
-            print(f"   ✅ Scene {scene_num} done → {out}")
+            prev_shot_success = True
         except Exception as e:
-            import traceback
-            print(f"   ❌ Scene {scene_num} failed: {type(e).__name__}: {e}")
-            traceback.print_exc()
-            outputs.append(None)
-            prev_output = None  # don't chain from a failed scene
+            print(f"   Shot {idx + 1} failed: {e}")
+            prev_shot_success = False
+            continue
 
-    # ── Summary ───────────────────────────────────────────────────────────
-    print("\n" + "═" * 70)
-    print("🎬 Storyboard Complete")
-    print(f"   Total scenes : {len(scenes)}")
-    print(f"   Successful   : {sum(1 for p in outputs if p)}")
-    print(f"   Failed       : {sum(1 for p in outputs if not p)}")
-    print("\n   Output paths:")
-    for i, p in enumerate(outputs):
-        status = "✅" if p else "❌"
-        print(f"   {status} Scene {i+1}: {p or 'FAILED'}")
-    print("═" * 70)
+        dest = os.path.join(output_dir, f"shot_{idx + 1:03d}.mp4")
+        shutil.copy2(clip_path, dest)
+        clip_paths.append(dest)
 
-    return outputs
+        if USE_SCENE_CONTINUITY:
+            last_frame = get_last_frame_tensor(dest)
+            current_image = last_frame if last_frame is not None else current_image
+
+        if show_previews:
+            display_video(dest)
+
+    print(f"\n[Storyboard] Complete: {len(clip_paths)} clips generated.")
+    return clip_paths
 
 
-print("✅ Storyboard runner ready.")
-print("   Edit SCENES list above, then set USE_STORYBOARD=True in Cell 9.")
+# ── Example STORY_BEATS for InfiniteFlowEngine ────────────────────────────────
+STORY_BEATS = [
+    "A woman arrives at the entrance of a dimly lit apartment building at night, "
+    "pushing through the glass door, rain dripping from her jacket",
+
+    "She takes the elevator, watching the floor numbers tick upward, "
+    "her reflection ghostly in the steel doors",
+
+    "She unlocks her front door and steps inside the dark apartment, "
+    "not turning on the lights, setting her keys on the counter quietly",
+
+    "She moves to the kitchen, opens the fridge, stares blankly at the shelves, "
+    "the cold blue light illuminating her face",
+
+    "She notices a note on the kitchen table, picks it up slowly, "
+    "her expression shifting from curiosity to alarm",
+
+    "She grabs her phone, dials a number, presses it to her ear. "
+    "No answer. She tries again. Silence.",
+]
+
+
+# ── Build STORYBOARD from SCENE_JSON using build_shot_prompt_pro ──────────────
+def build_storyboard_from_json(scene_json: dict) -> List[dict]:
+    """Parse SCENE_JSON into a STORYBOARD list using build_shot_prompt_pro."""
+    storyboard = []
+    shots = scene_json.get("story_action", {}).get("shots", [])
+    for idx, shot in enumerate(shots):
+        prev_shot = shots[idx - 1] if idx > 0 else None
+        full_prompt = build_shot_prompt_pro(shot, scene_json, idx)
+        camera_lora_key, camera_lora_file = get_camera_lora_for_shot(shot)
+        storyboard.append({
+            "id": f"shot_{idx + 1:02d}",
+            "prompt": full_prompt,
+            "shot_data": shot,
+            "camera_lora": camera_lora_file if USE_MOTION_LORAS else None,
+            "prev_shot": prev_shot,
+        })
+    return storyboard
+
+
+print("InfiniteFlowEngine + Storyboard runner defined.")
+print(f"   Example STORY_BEATS: {len(STORY_BEATS)} beats")
+print("   Use build_storyboard_from_json(SCENE_JSON) for PRO JSON storyboard")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2010,120 +2176,148 @@ print("   Edit SCENES list above, then set USE_STORYBOARD=True in Cell 9.")
 # ══════════════════════════════════════════════════════════════════════════════
 
 # @title  { "single-column": true }
-# @markdown ## 💥 9. Generate
-# @markdown Re-run this cell for each new video or storyboard.
-# @markdown Seed auto-increments after each successful generation.
-# @markdown
-# @markdown Set `USE_STORYBOARD = True` (Cell 8) to run multi-scene mode.
+# @markdown ## 9. Run Generation
+# @markdown **Mode A**: Single clip (quick test)
+# @markdown **Mode B**: Storyboard/Infinite Flow (multi-scene)
 
-_current_seed = SEED
+# @markdown ### Run Mode
+RUN_MODE = "single"  # @param ["single", "storyboard", "infinite_flow"]
 
-try:
-    if USE_STORYBOARD:
-        # ── Multi-scene storyboard mode ───────────────────────────────────
-        print("🎬 Running storyboard mode…")
-        storyboard_outputs = run_storyboard(
-            scenes=SCENES,
-            use_continuity=USE_SCENE_CONTINUITY,
+def _run_single():
+    """Generate a single clip using Cell 6 settings."""
+    # Determine prompt
+    if not BYPASS_EASY_PROMPT and USER_INPUT.strip():
+        print("Running EasyPromptEngine...")
+        engine = EasyPromptEngine(LLM_MODEL, offline=False, keep_loaded=False)
+        pos_prompt, neg_prompt = engine.generate(
+            user_input=USER_INPUT,
+            frame_count=FRAMES,
+            creativity=CREATIVITY,
+            seed=SEED,
+            lora_triggers=LORA_TRIGGERS,
         )
-        output = storyboard_outputs[-1] if storyboard_outputs else None
-        if AUTO_INCREMENT_SEED:
-            SEED = _current_seed + len(SCENES)
-            print(f"🔢 Next seed: {SEED}")
-
+        cleanup_memory()
+        print(f"\n   EXPANDED: {pos_prompt[:200]}...")
     else:
-        # ── Single-clip mode ──────────────────────────────────────────────
-        output = generate_pro(
-            user_input             = USER_INPUT,
-            image_path             = IMAGE_PATH,
-            positive_prompt        = POSITIVE_PROMPT,
-            negative_prompt        = NEGATIVE_PROMPT,
-            width                  = WIDTH,
-            height                 = HEIGHT,
-            frames                 = FRAMES,
-            fps                    = FPS,
-            seed                   = _current_seed,
-            image_strength         = IMAGE_STRENGTH,
-            character_image_path   = CHARACTER_IMAGE_PATH,
-            character_strength     = CHARACTER_STRENGTH,
-            character_mode         = CHARACTER_CONSISTENCY_MODE,
-            character_name         = CHARACTER_NAME,
-            character_description  = CHARACTER_DESCRIPTION,
-            pass1_sigmas           = PASS1_SIGMAS,
-            pass1_sampler          = PASS1_SAMPLER,
-            pass1_cfg              = PASS1_CFG,
-            pass2_sigmas           = PASS2_SIGMAS,
-            pass2_sampler          = PASS2_SAMPLER,
-            pass2_cfg              = PASS2_CFG,
-            pass2_seed             = PASS2_SEED,
-            pro_mode               = PRO_MODE,
-            pro_steps              = PRO_STEPS,
-            pro_scheduler          = PRO_SCHEDULER,
-            pro_split_at           = PRO_SPLIT_AT,
-            use_tiled_vae          = USE_TILED_VAE,
-            tiled_spatial_tiles    = TILED_SPATIAL_TILES,
-            tiled_spatial_overlap  = TILED_SPATIAL_OVERLAP,
-            tiled_temporal_len     = TILED_TEMPORAL_LEN,
-            tiled_temporal_overlap = TILED_TEMPORAL_OVERLAP,
-            tiled_last_frame_fix   = TILED_LAST_FRAME_FIX,
-            lora_stack             = LORA_STACK,
-            lora_stack_json        = LORA_STACK_JSON,
-            output_prefix          = OUTPUT_PREFIX,
-        )
+        pos_prompt = POSITIVE_PROMPT
+        neg_prompt = NEGATIVE_PROMPT
 
-        # Mirrors "Shared seed" node [284] increment mode in LD-I2V.json
-        if AUTO_INCREMENT_SEED:
-            SEED = _current_seed + 1
-            print(f"🔢 Next seed: {SEED}")
+    # Load image if provided
+    img_tensor = None
+    if IMAGE_PATH:
+        img_tensor = load_image_tensor(IMAGE_PATH)
+        if img_tensor is not None:
+            print(f"   Image loaded: {IMAGE_PATH}")
+        else:
+            print(f"   Image not found: {IMAGE_PATH} -> T2V mode")
 
-except KeyboardInterrupt:
-    print("\n⚠️  Interrupted — partial output may be in /content/ComfyUI/output/")
+    # Generate
+    output = generate_clip(
+        image_tensor=img_tensor,
+        prompt=pos_prompt,
+        neg_prompt=neg_prompt,
+        width=WIDTH,
+        height=HEIGHT,
+        frames=FRAMES,
+        fps=FPS,
+        seed=SEED,
+        image_strength=IMAGE_STRENGTH,
+    )
 
-except FileNotFoundError as e:
-    print(f"\n❌ Missing models: {e}")
-    print("   Run Cell 2 to download, then retry Cell 9.")
+    if SHOW_PREVIEWS:
+        display_video(output)
+    if DOWNLOAD_AFTER_GENERATE:
+        files.download(output)
 
+    # Auto-increment seed for next run
+    if AUTO_INCREMENT_SEED:
+        global SEED
+        SEED += 1
+
+    return output
+
+
+def _run_storyboard():
+    """Run from SCENE_JSON using build_shot_prompt_pro."""
+    storyboard = build_storyboard_from_json(SCENE_JSON)
+    print(f"   Parsed {len(storyboard)} shots from SCENE_JSON")
+    clip_paths = run_storyboard(
+        storyboard=storyboard,
+        seed_image_path=IMAGE_PATH,
+        base_seed=SEED,
+        show_previews=SHOW_PREVIEWS,
+    )
+    if len(clip_paths) > 1:
+        final = concatenate_clips(
+            clip_paths, "/content/ComfyUI/output/storyboard/final.mp4")
+        print(f"\n   Final video: {final}")
+        if SHOW_PREVIEWS:
+            display_video(final)
+    return clip_paths
+
+
+def _run_infinite_flow():
+    """Run InfiniteFlowEngine with STORY_BEATS."""
+    bible = CharacterBible()
+    if CHARACTER_DESCRIPTION:
+        bible.add(CHARACTER_NAME, description=CHARACTER_DESCRIPTION)
+
+    engine = InfiniteFlowEngine(
+        character_bible=bible,
+        llm_model=LLM_MODEL,
+        vision_model=VISION_MODEL,
+        width=WIDTH,
+        height=HEIGHT,
+        frames=FRAMES,
+        fps=FPS,
+        image_strength=IMAGE_STRENGTH,
+        creativity=CREATIVITY,
+        lora_triggers=LORA_TRIGGERS,
+        use_vision=USE_VISION,
+        use_tiled_vae=USE_TILED_VAE,
+        offline=False,
+        output_dir="/content/ComfyUI/output/infinite_flow",
+        show_previews=SHOW_PREVIEWS,
+    )
+
+    clip_paths = engine.run(
+        story_beats=STORY_BEATS,
+        seed_image_path=IMAGE_PATH,
+        base_seed=SEED,
+    )
+
+    engine.save_bible("/content/character_bible.json")
+
+    if len(clip_paths) > 1:
+        final = engine.concat_all("full_video.mp4")
+        print(f"\n   Final video: {final}")
+        if SHOW_PREVIEWS:
+            display_video(final)
+
+    return clip_paths
+
+
+# ── Execute ───────────────────────────────────────────────────────────────────
+try:
+    if RUN_MODE == "single":
+        _run_single()
+    elif RUN_MODE == "storyboard":
+        _run_storyboard()
+    elif RUN_MODE == "infinite_flow":
+        _run_infinite_flow()
+    else:
+        print(f"Unknown RUN_MODE: {RUN_MODE}")
 except torch.cuda.OutOfMemoryError:
     cleanup_memory()
-    print("\n❌ CUDA Out of Memory")
-    print(f"   Current settings: {WIDTH}×{HEIGHT}, {FRAMES} frames")
-    print("   ── Suggested fixes ─────────────────────────────────────────────")
-    print("   T4  (15 GB): WIDTH=768,  HEIGHT=512,  FRAMES=97")
-    print("   L4  (24 GB): WIDTH=1024, HEIGHT=576,  FRAMES=161")
-    print("   A100(40 GB): WIDTH=1280, HEIGHT=720,  FRAMES=241")
-    print("   ── Also try ────────────────────────────────────────────────────")
-    print("   • LLM_MODEL='3B'         in Cell 4  (reduce LLM VRAM footprint)")
-    print("   • USE_CHUNK_FF=True      in Cell 5  (chunk feedforward for T4)")
-    print("   • USE_TILED_VAE=True     in Cell 6  (tile VAE decode)")
-    print("   • TILED_SPATIAL_TILES=4  in Cell 6  (more tiles = less VRAM per tile)")
-    print("   • PRO_MODE=False         in Cell 5  (simpler sigma schedule)")
-
-except RuntimeError as e:
-    print(f"\n❌ Runtime error: {e}")
-    cleanup_memory()
-
+    print("\n--- OUT OF MEMORY ---")
+    print("Quick fixes:")
+    print("  1. Reduce FRAMES (try 73 for T4)")
+    print("  2. Reduce resolution (try 768x432)")
+    print("  3. Set USE_TILED_VAE = True")
+    print("  4. Set USE_CHUNK_FF = True")
+    print("  5. Restart runtime and run again")
 except Exception as e:
+    print(f"\nError: {type(e).__name__}: {e}")
+    print("If models are missing, run Cell 2 first.")
     import traceback
-    print(f"\n❌ Error: {type(e).__name__}: {e}")
     traceback.print_exc()
-    print("\n💡 Quick-fix reference:")
-    print("   'UnetLoaderGGUF' not found       → Cell 1: clone ComfyUI_GGUF")
-    print("   'LTX2PromptArchitect' not found  → Cell 1: clone LTX2EasyPrompt-LD")
-    print("   'LTX2MasterLoaderLD' not found   → Cell 1: clone LTX2-Master-Loader")
-    print("   'LTXVImgToVideoInplace' missing  → Cell 1: clone ComfyUI-LTXVideo")
-    print("   'LTXVPreprocess' missing         → Cell 1: clone ComfyUI-LTXVideo")
-    print("   'LTXVCropGuides' missing         → Cell 1: clone ComfyUI-LTXVideo")
-    print("   'PathchSageAttentionKJ' missing  → Cell 1: clone ComfyUI_KJNodes  "
-          "  (or set USE_SAGE_ATTENTION=False)")
-    print("   'LTXVChunkFeedForward' missing   → Cell 1: clone ComfyUI-LTXVideo  "
-          "  (or set USE_CHUNK_FF=False)")
-    print("   'VHS_VideoCombine' missing       → Cell 1: clone ComfyUI-VideoHelperSuite  "
-          "  (auto-fallback to CreateVideo)")
-    print("   'ModelSamplingSD3' missing       → set PRO_MODE=False in Cell 5")
-    print("   'BasicScheduler' missing         → set PRO_MODE=False in Cell 5")
-    print("   DualCLIPLoader fp4 error         → swap CLIP_NAME1 to fp8 in Cell 6")
-    print("   Tiled VAE error                  → set USE_TILED_VAE=False in Cell 6")
-    print("   Deformed output in Pass 1        → change SEED and re-run Cell 9")
-    print("   Persistent deformation (3× same) → change USER_INPUT / POSITIVE_PROMPT")
-    print("   Character drift                  → try CHARACTER_CONSISTENCY_MODE='both'")
-    print("                                      or increase CHARACTER_STRENGTH")
