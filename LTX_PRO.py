@@ -1780,9 +1780,9 @@ def generate_pro(
             samples=get_value_at_index(cropped, 2),
             upscale_model=upscale_model,
             vae=vae_video)
-        del upscale_model
+        if not ENABLE_MODEL_CACHE:
+            del upscale_model
         cleanup_memory()
-
         # [LTXVConcatAVLatent] [117] — upsampled video + audio
         av_lat2 = catav.EXECUTE_NORMALIZED(
             video_latent=get_value_at_index(upsampled, 0),
@@ -1804,7 +1804,9 @@ def generate_pro(
                 "  Fix: Try reducing TILED_SPATIAL_TILES or USE_TILED_VAE=False."
             )
 
-        del guider_p2, unet
+        del guider_p2
+        if not ENABLE_MODEL_CACHE:
+            del unet
         cleanup_memory()
         print("   ✓ Pass 2 complete")
 
@@ -1852,7 +1854,8 @@ def generate_pro(
                 vaedecode.decode(samples=vid_lat_fin, vae=vae_video), 0)
             print("   ✓ Standard VAE decode (VAEDecode)")
 
-        del vae_video
+        if not ENABLE_MODEL_CACHE:
+            del vae_video
         cleanup_memory()
 
         # ── Audio decode [201] ─────────────────────────────────────────────
