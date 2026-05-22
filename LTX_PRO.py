@@ -293,7 +293,6 @@ def cleanup_memory(verbose: bool = False) -> None:
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
         torch.cuda.ipc_collect()
-        torch.cuda.reset_peak_memory_stats()
     if verbose:
         if torch.cuda.is_available():
             _after = torch.cuda.memory_allocated()
@@ -322,7 +321,7 @@ def get_gpu_memory_gb():
         return torch.cuda.get_device_properties(0).total_memory / 1024**3
     return 0
 
-IS_T4_GPU = get_gpu_memory_gb() < 17
+IS_LOW_VRAM_GPU = get_gpu_memory_gb() < 17
 
 def _print_vram() -> None:
     if not torch.cuda.is_available():
@@ -1756,7 +1755,7 @@ def generate_pro(
                 vaedecode.decode(samples=vid_lat_fin, vae=vae_video), 0)
             print("   ✓ Standard VAE decode (VAEDecode)")
 
-        del vid_lat_fin, aud_lat_fin, vae_video
+        del vid_lat_fin, vae_video
         cleanup_memory(verbose=True)
 
         # ── Audio decode [201] ─────────────────────────────────────────────
@@ -1770,7 +1769,7 @@ def generate_pro(
             print(f"   ⚠️  Audio decode failed ({e}) — proceeding without audio.")
             audio_out = None
 
-        del vae_audio
+        del aud_lat_fin, vae_audio
         cleanup_memory(verbose=True)
 
         # ══════════════════════════════════════════════════════════════════
@@ -1897,7 +1896,7 @@ def generate_pro(
         except Exception as e:
             print(f"   ⚠️  Download failed ({e}) — file is at {output_path}")
 
-    deep_cleanup()
+    cleanup_memory(verbose=True)
     return output_path
 
 
@@ -1983,8 +1982,8 @@ def run_storyboard(
     print("🎬 Storyboard Runner — Starting")
     print(f"   Scenes    : {len(scenes)}")
     print(f"   Continuity: {use_continuity}")
-    if IS_T4_GPU:
-        print("   ⚠️  T4 GPU detected — extra memory safeguards active")
+    if IS_LOW_VRAM_GPU:
+        print("   ⚠️  Low-VRAM GPU detected — extra memory safeguards active")
     print("─" * 70)
 
     for i, scene in enumerate(scenes):
@@ -2008,54 +2007,39 @@ def run_storyboard(
             else:
                 print(f"   ⚠️  Could not extract last frame — skipping continuity.")
 
+        gen_kwargs = {
+            "user_input":            scene.get("user_input", USER_INPUT),
+            "image_path":            _image_path,
+            "positive_prompt":       scene.get("positive_prompt", POSITIVE_PROMPT),
+            "negative_prompt":       scene.get("negative_prompt", NEGATIVE_PROMPT),
+            "width":                 scene.get("width", WIDTH),
+            "height":                scene.get("height", HEIGHT),
+            "frames":                scene.get("frames", FRAMES),
+            "fps":                   scene.get("fps", FPS),
+            "seed":                  scene.get("seed", SEED),
+            "image_strength":        scene.get("image_strength", IMAGE_STRENGTH),
+            "character_image_path":  scene.get("character_image_path", CHARACTER_IMAGE_PATH),
+            "character_strength":    scene.get("character_strength", CHARACTER_STRENGTH),
+            "character_mode":        scene.get("character_mode", CHARACTER_CONSISTENCY_MODE),
+            "character_name":        scene.get("character_name", CHARACTER_NAME),
+            "character_description": scene.get("character_description", CHARACTER_DESCRIPTION),
+            "output_prefix":         scene.get("output_prefix", OUTPUT_PREFIX),
+        }
+
         try:
             try:
-                out = generate_pro(
-                    user_input           = scene.get("user_input", USER_INPUT),
-                    image_path           = _image_path,
-                    positive_prompt      = scene.get("positive_prompt", POSITIVE_PROMPT),
-                    negative_prompt      = scene.get("negative_prompt", NEGATIVE_PROMPT),
-                    width                = scene.get("width", WIDTH),
-                    height               = scene.get("height", HEIGHT),
-                    frames               = scene.get("frames", FRAMES),
-                    fps                  = scene.get("fps", FPS),
-                    seed                 = scene.get("seed", SEED),
-                    image_strength       = scene.get("image_strength", IMAGE_STRENGTH),
-                    character_image_path = scene.get("character_image_path", CHARACTER_IMAGE_PATH),
-                    character_strength   = scene.get("character_strength", CHARACTER_STRENGTH),
-                    character_mode       = scene.get("character_mode", CHARACTER_CONSISTENCY_MODE),
-                    character_name       = scene.get("character_name", CHARACTER_NAME),
-                    character_description= scene.get("character_description", CHARACTER_DESCRIPTION),
-                    output_prefix        = scene.get("output_prefix", OUTPUT_PREFIX),
-                )
+                out = generate_pro(**gen_kwargs)
             except torch.cuda.OutOfMemoryError:
                 print(f"   ⚠️  OOM on scene {scene_num} — attempting recovery…")
                 deep_cleanup()
                 time.sleep(5)
-                out = generate_pro(
-                    user_input           = scene.get("user_input", USER_INPUT),
-                    image_path           = _image_path,
-                    positive_prompt      = scene.get("positive_prompt", POSITIVE_PROMPT),
-                    negative_prompt      = scene.get("negative_prompt", NEGATIVE_PROMPT),
-                    width                = scene.get("width", WIDTH),
-                    height               = scene.get("height", HEIGHT),
-                    frames               = scene.get("frames", FRAMES),
-                    fps                  = scene.get("fps", FPS),
-                    seed                 = scene.get("seed", SEED),
-                    image_strength       = scene.get("image_strength", IMAGE_STRENGTH),
-                    character_image_path = scene.get("character_image_path", CHARACTER_IMAGE_PATH),
-                    character_strength   = scene.get("character_strength", CHARACTER_STRENGTH),
-                    character_mode       = scene.get("character_mode", CHARACTER_CONSISTENCY_MODE),
-                    character_name       = scene.get("character_name", CHARACTER_NAME),
-                    character_description= scene.get("character_description", CHARACTER_DESCRIPTION),
-                    output_prefix        = scene.get("output_prefix", OUTPUT_PREFIX),
-                )
+                out = generate_pro(**gen_kwargs)
             outputs.append(out)
             prev_output = out
             print(f"   ✅ Scene {scene_num} done → {out}")
             deep_cleanup()
             time.sleep(3)
-            if IS_T4_GPU:
+            if IS_LOW_VRAM_GPU:
                 time.sleep(2)
         except Exception as e:
             import traceback
