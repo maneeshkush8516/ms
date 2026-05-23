@@ -257,6 +257,27 @@ def _vram_print(tag=""):
     print(f"   VRAM [{bar}] {u:.1f}/{t:.1f} GB  {tag}")
 
 
+def _vram_guard(min_free_gb=3.0):
+    """Check available VRAM and force cleanup if below threshold.
+
+    Call before loading a major model (Vision, LLM, UNet) to prevent
+    OOM cascades when a previous engine failed to unload properly.
+    Returns available VRAM in GB after any cleanup.
+    """
+    if not torch.cuda.is_available():
+        return 0.0
+    free, total = torch.cuda.mem_get_info()
+    free_gb = free / 1024**3
+    if free_gb < min_free_gb:
+        print(f"   [VRAM Guard] Only {free_gb:.1f} GB free (need {min_free_gb:.1f}), forcing cleanup...")
+        aggressive_cleanup("VRAM guard pre-load")
+        free, total = torch.cuda.mem_get_info()
+        free_gb = free / 1024**3
+        if free_gb < min_free_gb:
+            print(f"   [VRAM Guard] Warning: still only {free_gb:.1f} GB free after cleanup")
+    return free_gb
+
+
 # -- ComfyUI node output accessor --
 
 def get_value_at_index(obj, index):
@@ -488,6 +509,8 @@ class VisionDescribeEngine:
         except ImportError:
             raise ImportError("[VisionDescribe] pip install qwen-vl-utils")
 
+        _vram_guard(min_free_gb=3.0)
+
         if isinstance(image, torch.Tensor):
             image = tensor_to_pil(image)
 
@@ -634,6 +657,7 @@ class EasyPromptEngine:
             return
         if self._model is not None:
             self._unload()
+        _vram_guard(min_free_gb=4.0)
         hf_id = self.MODELS[key]
         if not self.offline:
             os.environ.pop("TRANSFORMERS_OFFLINE", None)
@@ -657,10 +681,7 @@ class EasyPromptEngine:
 
     def _unload(self):
         if self._model is not None:
-            try:
-                self._model.to("cpu")
-            except Exception:
-                pass
+            del self._model
         self._model = None
         self._tok = None
         self._loaded_key = None
@@ -1314,13 +1335,18 @@ def generate_clip(
 
         cte = NODE_CLASS_MAPPINGS["CLIPTextEncode"]()
         cond_pos = cte.encode(text=prompt, clip=clip_raw)
-        zero_out = NODE_CLASS_MAPPINGS["ConditioningZeroOut"]()
-        cond_0 = zero_out.zero_out(conditioning=get_value_at_index(cond_pos, 0))
+        if neg_prompt:
+            cond_neg_raw = cte.encode(text=neg_prompt, clip=clip_raw)
+            cond_neg = get_value_at_index(cond_neg_raw, 0)
+        else:
+            zero_out = NODE_CLASS_MAPPINGS["ConditioningZeroOut"]()
+            cond_0 = zero_out.zero_out(conditioning=get_value_at_index(cond_pos, 0))
+            cond_neg = get_value_at_index(cond_0, 0)
         ltxv_cn = NODE_CLASS_MAPPINGS["LTXVConditioning"]()
         cond = ltxv_cn.EXECUTE_NORMALIZED(
             frame_rate=float(fps),
             positive=get_value_at_index(cond_pos, 0),
-            negative=get_value_at_index(cond_0, 0))
+            negative=cond_neg)
 
         # DELETE CLIP - frees ~6-8 GB for UNet
         del clip_raw
@@ -1331,6 +1357,7 @@ def generate_clip(
         # STEP 2: Load UNet + apply LoRAs
         # ============================================================
         print("   [Clip] Loading UNet (GGUF Q4_K_M)...")
+        _vram_guard(min_free_gb=5.0)
         unet_ld = NODE_CLASS_MAPPINGS["UnetLoaderGGUF"]()
         unet = get_value_at_index(unet_ld.load_unet(unet_name=unet_model), 0)
 
@@ -1669,26 +1696,31 @@ class StudioProductionEngine:
                 camera_lora_file=camera_lora_file,
                 camera_strength=0.8)
 
-            # Retry loop (max 3 attempts with seed variation)
+            # Retry loop (max 3 attempts with progressive OOM reduction)
             max_retries = 3
             success = False
             clip_path = None
             current_seed = beat_seed
+            retry_frames = self.frames
+            retry_width = self.width
+            retry_height = self.height
+            retry_tiled = self.use_tiled_vae
 
             for attempt in range(max_retries):
                 try:
-                    print(f"   [Studio] Generating (attempt {attempt + 1}, seed={current_seed})...")
+                    print(f"   [Studio] Generating (attempt {attempt + 1}, seed={current_seed}, "
+                          f"frames={retry_frames}, {retry_width}x{retry_height})...")
                     clip_path = generate_clip(
                         image_tensor=current_image,
                         prompt=expanded_prompt,
                         neg_prompt=neg_prompt,
-                        width=self.width,
-                        height=self.height,
-                        frames=self.frames,
+                        width=retry_width,
+                        height=retry_height,
+                        frames=retry_frames,
                         fps=self.fps,
                         seed=current_seed,
                         image_strength=strength,
-                        use_tiled_vae=self.use_tiled_vae,
+                        use_tiled_vae=retry_tiled,
                         lora_stack=lora_stack,
                         output_prefix=f"{self.project_name}_{shot_num:02d}",
                     )
@@ -1698,7 +1730,15 @@ class StudioProductionEngine:
                 except torch.cuda.OutOfMemoryError:
                     aggressive_cleanup("OOM recovery")
                     current_seed += 1
-                    print(f"   [Studio] OOM, retrying with seed {current_seed}...")
+                    # Progressively reduce frames by 24 per retry
+                    retry_frames = max(retry_frames - 24, 25)
+                    # On 3rd retry, also force tiled VAE and reduce resolution
+                    if attempt >= 1:
+                        retry_tiled = True
+                        retry_width = max(retry_width - 128, 512)
+                        retry_height = max(retry_height - 64, 320)
+                    print(f"   [Studio] OOM, reducing to {retry_frames}f "
+                          f"{retry_width}x{retry_height}, seed {current_seed}...")
                 except Exception as e:
                     print(f"   [Studio] Error: {type(e).__name__}: {e}")
                     current_seed += 1
@@ -1908,7 +1948,8 @@ EXAMPLE_SCENE_JSON = {
 print("Configuration & Example Scene ready.")
 print(f"   Project: {PROJECT_NAME}  |  {WIDTH}x{HEIGHT} @ {FPS}fps")
 print(f"   Frames: {FRAMES}  |  LLM: {LLM_MODEL}  |  Vision: {VISION_MODEL}")
-print(f"   Example storyboard: {len(EXAMPLE_SCENE_JSON["story_action"]["shots"])} shots")
+num_example_shots = len(EXAMPLE_SCENE_JSON['story_action']['shots'])
+print(f"   Example storyboard: {num_example_shots} shots")
 
 
 # ======================================================================
