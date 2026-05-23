@@ -1,0 +1,22 @@
+{
+  "project_type": "Google Colab notebook (Python) - AI video generation pipeline using ComfyUI nodes",
+  "language": "Python",
+  "build_system": "Google Colab cell execution - no build system. Uses !pip and %cd magic commands.",
+  "test_framework": "None - validation is by syntax check and structural inspection",
+  "build_command": "python -c \"import ast; ast.parse(open('/projects/sandbox/ms/LTX.PY').read())\"",
+  "test_command": "python -c \"import ast; ast.parse(open('/projects/sandbox/ms/LTX.PY').read()); print('Syntax OK')\"",
+  "verification_instructions": "1. Run Python AST parse on the file to confirm valid syntax. 2. Verify all 10 cells are present with proper @title and @param annotations. 3. Verify key classes exist: CharacterBible, VisionDescribeEngine, EasyPromptEngine, InfiniteFlowEngine. 4. Verify generate_clip() function exists with CLIP-first-then-UNet pattern.",
+  "snapshot_or_generated_files": null,
+  "setup_instructions": "No setup needed - this is a file modification task. The file is a Colab notebook in .py format.",
+  "environment_constraints": "INTEGRATIONS_ONLY network - cannot install packages or run ComfyUI. Validation must be AST-based only. Cannot test actual GPU execution.",
+  "contribution_requirements": "The file must use Colab-specific syntax: !pip, %cd, # @param, # @title, # @markdown. Must maintain VRAM under 13GB peak for T4 GPU.",
+  "key_patterns": "CLIP-first-then-UNet memory pattern (load CLIP, encode, delete CLIP, then load UNet). Per-stage VAE loading. Two-pass sampling (half-res euler + upscaled gradient_estimation). ComfyUI NODE_CLASS_MAPPINGS calls with get_value_at_index(). ResizeImageMaskNode.EXECUTE_NORMALIZED for I2V conditioning.",
+  "relevant_files": [
+    "/projects/sandbox/ms/LTX.PY",
+    "/projects/sandbox/ms/LTX_PRO.py",
+    "/projects/sandbox/ms/LTX2_InfiniteFlow_12Scene.py",
+    "/projects/sandbox/ms/LTX2_Infinite_Flow_PRO_v2.py",
+    "/projects/sandbox/ms/LTX_Studio_Pipeline.py"
+  ],
+  "directory_structure": "/projects/sandbox/ms/ - repository root with all pipeline files as .py Colab notebooks"
+}
