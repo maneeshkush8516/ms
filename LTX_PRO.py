@@ -458,7 +458,7 @@ def purge_vram(label: str = "") -> None:
         try:
             node = NODE_CLASS_MAPPINGS["LayerUtility: PurgeVRAM V2"]()
             fn   = getattr(node, node.FUNCTION)
-            fn()
+            fn(anything="", purge_cache=True, purge_models=True)
             print(f"   ✓ VRAM purged via PurgeVRAM V2{tag}")
             return
         except Exception as e:
@@ -1372,44 +1372,25 @@ def generate_pro(
         # ── I2V conditioning branch ────────────────────────────────────────
         if _use_i2v and _ref_tensor is not None:
             try:
-                # Resize reference image to full target resolution first
-                # [246] ResizeImagesByLongerEdge - longer_edge=1536
-                if "ResizeImagesByLongerEdge" in NODE_CLASS_MAPPINGS:
-                    rle     = NODE_CLASS_MAPPINGS["ResizeImagesByLongerEdge"]()
-                    _ref_tensor = get_value_at_index(
-                        rle.resize(images=_ref_tensor, longer_edge=1536), 0)
+                # Step 1: Resize reference image to target W x H using ResizeImageMaskNode
+                # (matches the working LTX2_Infinite_Flow_PRO_v2.py pattern)
+                _rim_i2v = NODE_CLASS_MAPPINGS["ResizeImageMaskNode"]()
+                _ref_tensor = get_value_at_index(
+                    _rim_i2v.EXECUTE_NORMALIZED(
+                        input=_ref_tensor,
+                        scale_method="lanczos",
+                        resize_type={"resize_type": "scale dimensions",
+                                     "width": width, "height": height,
+                                     "crop": "center"}), 0)
 
-                # [165] ImageResizeKJv2 - precise resize to half_w*2 x half_h*2
-                if "ImageResizeKJv2" in NODE_CLASS_MAPPINGS:
-                    ikj2 = NODE_CLASS_MAPPINGS["ImageResizeKJv2"]()
+                # Step 2: [246] ResizeImagesByLongerEdge - longer_edge = max(W, H)
+                # Uses EXECUTE_NORMALIZED (not .resize) - matches PRO_v2 working code
+                if "ResizeImagesByLongerEdge" in NODE_CLASS_MAPPINGS:
+                    rle = NODE_CLASS_MAPPINGS["ResizeImagesByLongerEdge"]()
                     _ref_tensor = get_value_at_index(
-                        ikj2.resize(
-                            image=_ref_tensor,
-                            width=half_w * 2,
-                            height=half_h * 2,
-                            upscale_method="lanczos",
-                            keep_proportion="crop",
-                            pad_color="0, 0, 0",
-                            crop_position="center",
-                            divisible_by=2,
-                            device="cpu",
-                        ), 0)
-                else:
-                    # Fallback: ResizeImageMaskNode - use scale by multiplier to
-                    # approximate the target size. Note: "scale dimensions" mode is
-                    # not a valid resize_type for this node; only "scale by multiplier"
-                    # and "scale to fit" are documented in LD-I2V.json widgets_values.
-                    # We compute a representative scale factor for the longer edge.
-                    rim2 = NODE_CLASS_MAPPINGS["ResizeImageMaskNode"]()
-                    _orig_h, _orig_w = _ref_tensor.shape[1], _ref_tensor.shape[2]
-                    _scale = max((half_w * 2) / max(_orig_w, 1),
-                                 (half_h * 2) / max(_orig_h, 1))
-                    _ref_tensor = get_value_at_index(
-                        rim2.EXECUTE_NORMALIZED(
-                            input=_ref_tensor,
-                            scale_method="lanczos",
-                            resize_type={"resize_type": "scale by multiplier",
-                                         "multiplier": _scale}), 0)
+                        rle.EXECUTE_NORMALIZED(
+                            longer_edge=max(width, height),
+                            images=_ref_tensor), 0)
 
                 # [162] LTXVPreprocess - compress/normalise image before I2V injection
                 # img_compression=33 matches LD-I2V.json node [162] widgets_values
