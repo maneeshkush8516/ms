@@ -1,0 +1,7 @@
+{
+  "task_id": "task-ltx-studio-pipeline",
+  "task_description": "Build a complete LTX Studio-style pipeline as a single Python file (Google Colab notebook) that combines CHARACTER CONSISTENCY, SCENE CONTINUITY, scripting, storyboarding, multi-character support, motion control, and voice sync features from all three existing pipeline files into one cohesive production system.",
+  "status": "in_progress",
+  "feature_order": ["FEAT-001"],
+  "blocked_reason": null
+}
