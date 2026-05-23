@@ -2,7 +2,7 @@
   "id": "FEAT-001",
   "type": "fix",
   "description": "Restructure generate_pro() model loading order and add per-stage VAE loading to prevent OOM on T4. Add aggressive_cleanup() helper function. This is the core fix that addresses Fixes 1, 2, and 3 from the requirements.",
-  "status": "in_progress",
+  "status": "completed",
   "steps": [
     "Step 1: Add the aggressive_cleanup() helper function right after the existing cleanup_memory() function (around line 260). The function should include gc.collect(), torch.cuda.synchronize(), torch.cuda.empty_cache(), torch.cuda.ipc_collect(), and a second gc.collect(). Accept a label parameter and call _print_vram(label) if label is provided. Also update the existing cleanup_memory() to call torch.cuda.synchronize() BEFORE torch.cuda.empty_cache() (currently it's after).",
     "Step 2: Restructure the PHASE 1 and PHASE 2 sections of generate_pro() to follow this order: (a) Load CLIP via DualCLIPLoader, (b) Encode text (CLIPTextEncode positive, negative, ConditioningZeroOut, LTXVConditioning), (c) DELETE clip_model and call aggressive_cleanup('CLIP deleted'), (d) THEN load UNet via UnetLoaderGGUF, (e) Apply LoRA stack (note: pass None for clip_model since IC/camera LoRAs don't modify CLIP - this matches the pattern in LTX2_InfiniteFlow_12Scene.py where _apply_loras is called with _dummy_clip=None), (f) Apply sage attention and chunk FF patches.",
@@ -27,5 +27,5 @@
     "Run: python -c \"import ast; tree=ast.parse(open('/projects/sandbox/ms/LTX_PRO.py').read()); funcs=[n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]; assert 'generate_pro' in funcs; assert 'aggressive_cleanup' in funcs; assert 'run_storyboard' in funcs; print('All key functions present')\""
   ],
   "blocked_reason": null,
-  "findings": ""
+  "findings": "AST validation requires stripping Colab magic lines (!pip, %cd) before parsing since they are not valid Python syntax. The validation command in the feature uses direct ast.parse which will fail on raw Colab files. Use the stripping approach: comment out lines starting with ! or % before parsing. _print_vram() was updated to accept an optional label parameter to support aggressive_cleanup() calling it with a label string."
 }
