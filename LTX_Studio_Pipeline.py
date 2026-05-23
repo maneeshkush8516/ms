@@ -1833,34 +1833,71 @@ print("Production Engine ready (generate_clip + StudioProductionEngine).")
 # @markdown ## 8. Configuration & Example Scene
 # @markdown All parameters and the Whispering Cave 12-shot storyboard.
 
-# -- Project Configuration --
-PROJECT_NAME = "Whispering_Cave"
-WIDTH = 848
-HEIGHT = 480
-FPS = 24
-FRAMES = 121
+# @markdown ### Project Settings
+PROJECT_NAME = "Whispering_Cave"  # @param {type:"string"}
+WIDTH = 848  # @param {type:"integer"}
+HEIGHT = 480  # @param {type:"integer"}
+FPS = 24  # @param {type:"integer"}
+FRAMES = 121  # @param {type:"integer"}
+# T4 safe: 768x512, 97 frames | L4: 1024x576, 161 frames | A100: 1280x720, 241 frames
 
-# -- Engine Settings --
-LLM_MODEL = "8B"
-VISION_MODEL = "3B-fast"
-CREATIVITY = 0.9
-USE_VISION = True
-USE_TILED_VAE = True
-SEED_IMAGE_PATH = None
-BASE_SEED = 42
+# @markdown ### AI Engine Settings
+LLM_MODEL = "3B"  # @param ["3B", "8B", "14B"]
+# "3B" = Llama-3.2 (T4 safe, ~4 GB) | "8B" = NeuralDaredevil (~10 GB) | "14B" = Qwen3 (~18 GB)
+VISION_MODEL = "3B-fast"  # @param ["3B-fast", "7B-nsfw"]
+# "3B-fast" = Qwen2.5-VL-3B (~5 GB) | "7B-nsfw" = Qwen2.5-VL-7B (~10 GB)
+CREATIVITY = 0.9  # @param {type:"number"}
+# 0.7 = Literal | 0.9 = Balanced | 1.1 = Artistic
+USE_VISION = True  # @param {type:"boolean"}
+# Analyse reference images with Vision model for scene context
+USE_TILED_VAE = True  # @param {type:"boolean"}
+# VRAM-efficient tiled VAE decode (recommended for T4)
 
-# -- Continuity Settings --
-OVERLAP_FRAMES = 16
-ANCHOR_STRENGTH_HIGH = 0.85
-ANCHOR_STRENGTH_LOW = 0.70
-USE_ADAPTIVE_STRENGTH = True
+# @markdown ### Seed & Reference Image
+SEED_IMAGE_PATH = None  # @param {type:"string"}
+# Path to seed image for first shot (e.g. "/content/ComfyUI/input/character.jpg")
+BASE_SEED = 42  # @param {type:"integer"}
+# Starting seed (auto-incremented per shot)
 
-# -- Feature Toggles --
-USE_CHARACTER_LORAS = True
-USE_MOTION_LORAS = True
-USE_VOICE_SYNC = True
-GENERATE_SUBTITLES = True
-SHOW_PREVIEWS = True
+# @markdown ### Continuity & Anchor Settings
+OVERLAP_FRAMES = 16  # @param {type:"integer"}
+# Number of overlap frames for scene transitions
+ANCHOR_STRENGTH_HIGH = 0.85  # @param {type:"number"}
+# Maximum I2V anchor strength (0.0-1.0)
+ANCHOR_STRENGTH_LOW = 0.70  # @param {type:"number"}
+# Minimum I2V anchor strength floor
+USE_ADAPTIVE_STRENGTH = True  # @param {type:"boolean"}
+# Auto-adjust strength based on motion/character changes
+
+# @markdown ### Feature Toggles
+USE_CHARACTER_LORAS = True  # @param {type:"boolean"}
+# Load character-specific LoRAs for consistency
+USE_MOTION_LORAS = True  # @param {type:"boolean"}
+# Apply camera movement LoRAs per shot
+USE_VOICE_SYNC = True  # @param {type:"boolean"}
+# Inject dialogue/lip-sync guidance into prompts
+GENERATE_SUBTITLES = True  # @param {type:"boolean"}
+# Generate subtitle timing data
+SHOW_PREVIEWS = True  # @param {type:"boolean"}
+# Display each clip inline after generation
+
+# @markdown ### IC LoRA & Performance
+IC_LORA = "detailer"  # @param ["none", "detailer", "canny", "depth", "pose"]
+IC_LORA_STRENGTH = 0.4  # @param {type:"number"}
+# Image conditioning LoRA type and strength
+CAMERA_LORA_STRENGTH = 0.8  # @param {type:"number"}
+# Camera movement LoRA strength (0.0-1.0)
+
+# @markdown ### Tiled VAE Settings
+TILED_SPATIAL_TILES = 2  # @param {type:"integer"}
+TILED_SPATIAL_OVERLAP = 8  # @param {type:"integer"}
+TILED_TEMPORAL_LEN = 48  # @param {type:"integer"}
+TILED_TEMPORAL_OVERLAP = 4  # @param {type:"integer"}
+
+# @markdown ### Output
+OUTPUT_DIR = "/content/ComfyUI/output"  # @param {type:"string"}
+DOWNLOAD_AFTER_GENERATE = False  # @param {type:"boolean"}
+# Auto-download final video to local machine
 
 
 # -- Example Scene JSON: Whispering Cave 12-shot storyboard --
@@ -1948,6 +1985,8 @@ EXAMPLE_SCENE_JSON = {
 print("Configuration & Example Scene ready.")
 print(f"   Project: {PROJECT_NAME}  |  {WIDTH}x{HEIGHT} @ {FPS}fps")
 print(f"   Frames: {FRAMES}  |  LLM: {LLM_MODEL}  |  Vision: {VISION_MODEL}")
+print(f"   IC LoRA: {IC_LORA} ({IC_LORA_STRENGTH})  |  Camera LoRA: {CAMERA_LORA_STRENGTH}")
+print(f"   Output: {OUTPUT_DIR}  |  Download: {DOWNLOAD_AFTER_GENERATE}")
 num_example_shots = len(EXAMPLE_SCENE_JSON['story_action']['shots'])
 print(f"   Example storyboard: {num_example_shots} shots")
 
@@ -1979,12 +2018,21 @@ production_config = {
     "USE_ADAPTIVE_STRENGTH": USE_ADAPTIVE_STRENGTH,
     "USE_MOTION_LORAS": USE_MOTION_LORAS,
     "USE_VOICE_SYNC": USE_VOICE_SYNC,
+    "USE_CHARACTER_LORAS": USE_CHARACTER_LORAS,
     "ANCHOR_STRENGTH_HIGH": ANCHOR_STRENGTH_HIGH,
     "ANCHOR_STRENGTH_LOW": ANCHOR_STRENGTH_LOW,
     "CREATIVITY": CREATIVITY,
     "SEED_IMAGE_PATH": SEED_IMAGE_PATH,
     "SHOW_PREVIEWS": SHOW_PREVIEWS,
-    "OUTPUT_DIR": "/content/ComfyUI/output",
+    "DOWNLOAD_AFTER_GENERATE": DOWNLOAD_AFTER_GENERATE,
+    "IC_LORA": IC_LORA,
+    "IC_LORA_STRENGTH": IC_LORA_STRENGTH,
+    "CAMERA_LORA_STRENGTH": CAMERA_LORA_STRENGTH,
+    "TILED_SPATIAL_TILES": TILED_SPATIAL_TILES,
+    "TILED_SPATIAL_OVERLAP": TILED_SPATIAL_OVERLAP,
+    "TILED_TEMPORAL_LEN": TILED_TEMPORAL_LEN,
+    "TILED_TEMPORAL_OVERLAP": TILED_TEMPORAL_OVERLAP,
+    "OUTPUT_DIR": OUTPUT_DIR,
 }
 
 # -- Instantiate production engine --
