@@ -426,7 +426,7 @@ print("Core utilities ready.")
 class CharacterBible:
     """
     Records named character attributes and serialises them as a prompt-injection
-    block. The block is passed to EasyPromptEngine as character_bible so the LLM
+    block. The block is passed to run_easy_prompt() as character_bible so the LLM
     receives a hard [NON-NEGOTIABLE] constraint preventing attribute drift.
     """
 
@@ -442,7 +442,7 @@ class CharacterBible:
         self._chars[name] = {"_raw": description.strip()}
 
     def to_prompt_block(self):
-        """Returns the injection string for EasyPromptEngine."""
+        """Returns the injection string for run_easy_prompt()."""
         if not self._chars:
             return ""
         lines = []
@@ -474,97 +474,113 @@ class CharacterBible:
         return f"CharacterBible({self.names()})"
 
 
-class VisionDescribeEngine:
+# -- VisionDescribe: ComfyUI LTX2VisionDescribe node wrapper (with standalone fallback) --
+
+_VISION_LABEL_MAP = {
+    "3B-fast": "Qwen2.5-VL-3B \u2014 Fast (huihui abliterated)",
+    "7B-nsfw": "Qwen2.5-VL-7B \u2014 Better NSFW (prithiv caption)",
+}
+
+_VISION_HF_FALLBACK = {
+    "3B-fast": "huihui-ai/Qwen2.5-VL-3B-Instruct-abliterated",
+    "7B-nsfw": "prithivMLmods/Qwen2.5-VL-7B-Abliterated-Caption-it",
+}
+
+_VISION_PROMPT = (
+    "Describe this image in one paragraph of plain sentences, 100-130 words. "
+    "Start with 'Style: photorealistic' or 'Style: anime' or 'Style: 3D animation' etc. "
+    "The FIRST sentence about any person MUST explicitly state ethnicity and skin tone "
+    "using plain terms: 'a Black man', 'a white woman', 'a South Asian man'. "
+    "Include age, hair colour and style, body type, clothing or nude state, pose, "
+    "camera framing, angle, lighting, time of day, and setting. "
+    "One flowing paragraph, no bullets, no labels. "
+    "If no person, describe environment, objects, lighting, mood."
+)
+
+
+def run_vision_describe(image_tensor, model_key="3B-fast"):
     """
-    Analyses an image and returns a 100-130 word scene description.
-    Standalone Qwen2.5-VL - loads, describes, unloads immediately.
+    Calls LTX2VisionDescribe ComfyUI node to analyse an image and return a scene
+    description string. Falls back to standalone Qwen2.5-VL if the node is missing.
+
+    image_tensor: ComfyUI NHWC float tensor (1,H,W,3).
+    model_key: "3B-fast" or "7B-nsfw".
+    Returns: scene_context string.
     """
+    _vram_guard(min_free_gb=3.0)
 
-    MODEL_OPTIONS = {
-        "3B-fast": "huihui-ai/Qwen2.5-VL-3B-Instruct-abliterated",
-        "7B-nsfw": "prithivMLmods/Qwen2.5-VL-7B-Abliterated-Caption-it",
-    }
+    # --- Primary path: ComfyUI LTX2VisionDescribe node ---
+    if "LTX2VisionDescribe" in NODE_CLASS_MAPPINGS:
+        print(f"   [VisionDescribe] model={model_key} | image shape={image_tensor.shape}")
+        node = NODE_CLASS_MAPPINGS["LTX2VisionDescribe"]()
+        result = node.describe(
+            image=image_tensor,
+            model_name=_VISION_LABEL_MAP.get(model_key,
+                "Qwen2.5-VL-3B \u2014 Fast (huihui abliterated)"),
+            offline_mode=False,
+            local_path="",
+        )
+        ctx = result[0]
+        print(f"   [VisionDescribe] Done ({len(ctx.split())} words).")
+        aggressive_cleanup("VisionDescribe done")
+        return ctx
 
-    PROMPT = (
-        "Describe this image in one paragraph of plain sentences, 100-130 words. "
-        "Start with 'Style: photorealistic' or 'Style: anime' or 'Style: 3D animation' etc. "
-        "The FIRST sentence about any person MUST explicitly state ethnicity and skin tone "
-        "using plain terms: 'a Black man', 'a white woman', 'a South Asian man'. "
-        "Include age, hair colour and style, body type, clothing or nude state, pose, "
-        "camera framing, angle, lighting, time of day, and setting. "
-        "One flowing paragraph, no bullets, no labels. "
-        "If no person, describe environment, objects, lighting, mood."
-    )
+    # --- Fallback: standalone Qwen2.5-VL ---
+    print("   [VisionDescribe] LTX2VisionDescribe node not found, using standalone fallback.")
+    from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
+    from huggingface_hub import snapshot_download
+    try:
+        from qwen_vl_utils import process_vision_info
+    except ImportError:
+        raise ImportError("[VisionDescribe] pip install qwen-vl-utils")
 
-    def __init__(self, model_key="3B-fast", offline=False):
-        self.model_key = model_key
-        self.offline = offline
+    image = tensor_to_pil(image_tensor) if isinstance(image_tensor, torch.Tensor) else image_tensor
+    hf_id = _VISION_HF_FALLBACK[model_key]
+    os.environ.pop("TRANSFORMERS_OFFLINE", None)
+    try:
+        source = snapshot_download(hf_id)
+    except Exception:
+        source = hf_id
 
-    def describe(self, image):
-        """Describe an image. Loads model, runs inference, unloads."""
-        from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
-        from huggingface_hub import snapshot_download
-        try:
-            from qwen_vl_utils import process_vision_info
-        except ImportError:
-            raise ImportError("[VisionDescribe] pip install qwen-vl-utils")
+    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    print(f"   [VisionDescribe] Loading {model_key} (standalone)...")
+    processor = AutoProcessor.from_pretrained(source)
+    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+        source, device_map="auto", torch_dtype=dtype)
+    model.eval()
 
-        _vram_guard(min_free_gb=3.0)
+    messages = [
+        {"role": "system", "content":
+         "You are an image analysis tool. Describe exactly what you see in plain prose."},
+        {"role": "user", "content": [
+            {"type": "image", "image": image},
+            {"type": "text", "text": _VISION_PROMPT},
+        ]},
+    ]
+    text_in = processor.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True)
+    img_in, vid_in = process_vision_info(messages)
+    inputs = processor(text=[text_in], images=img_in, videos=vid_in,
+                       padding=True, return_tensors="pt").to(model.device)
+    input_len = inputs["input_ids"].shape[1]
 
-        if isinstance(image, torch.Tensor):
-            image = tensor_to_pil(image)
+    tok = processor.tokenizer
+    stop_ids = [i for i in [tok.eos_token_id] if i is not None]
+    for s in ["<|im_end|>", "<|endoftext|>"]:
+        ids = tok.encode(s, add_special_tokens=False)
+        if len(ids) == 1 and ids[0] not in stop_ids:
+            stop_ids.append(ids[0])
 
-        hf_id = self.MODEL_OPTIONS[self.model_key]
-        if not self.offline:
-            os.environ.pop("TRANSFORMERS_OFFLINE", None)
-            try:
-                source = snapshot_download(hf_id)
-            except Exception:
-                source = hf_id
-        else:
-            os.environ["TRANSFORMERS_OFFLINE"] = "1"
-            source = hf_id
-
-        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-        print(f"   [VisionDescribe] Loading {self.model_key} ...")
-        processor = AutoProcessor.from_pretrained(source, local_files_only=self.offline)
-        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            source, device_map="auto", torch_dtype=dtype,
-            local_files_only=self.offline)
-        model.eval()
-
-        messages = [
-            {"role": "system", "content":
-             "You are an image analysis tool. Describe exactly what you see in plain prose."},
-            {"role": "user", "content": [
-                {"type": "image", "image": image},
-                {"type": "text", "text": self.PROMPT},
-            ]},
-        ]
-        text_in = processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True)
-        img_in, vid_in = process_vision_info(messages)
-        inputs = processor(text=[text_in], images=img_in, videos=vid_in,
-                           padding=True, return_tensors="pt").to(model.device)
-        input_len = inputs["input_ids"].shape[1]
-
-        tok = processor.tokenizer
-        stop_ids = [i for i in [tok.eos_token_id] if i is not None]
-        for s in ["<|im_end|>", "<|endoftext|>"]:
-            ids = tok.encode(s, add_special_tokens=False)
-            if len(ids) == 1 and ids[0] not in stop_ids:
-                stop_ids.append(ids[0])
-
-        with torch.no_grad():
-            out = model.generate(**inputs, max_new_tokens=210, temperature=0.3,
-                                 do_sample=True, top_p=0.9,
-                                 pad_token_id=tok.pad_token_id or tok.eos_token_id,
-                                 eos_token_id=stop_ids)
-        desc = tok.decode(out[0][input_len:], skip_special_tokens=True).strip()
-        del out, inputs, model, processor
-        _vram_free()
-        print(f"   [VisionDescribe] Done ({len(desc.split())} words).")
-        return desc
+    with torch.no_grad():
+        out = model.generate(**inputs, max_new_tokens=210, temperature=0.3,
+                             do_sample=True, top_p=0.9,
+                             pad_token_id=tok.pad_token_id or tok.eos_token_id,
+                             eos_token_id=stop_ids)
+    desc = tok.decode(out[0][input_len:], skip_special_tokens=True).strip()
+    del out, inputs, model, processor
+    aggressive_cleanup("VisionDescribe fallback done")
+    print(f"   [VisionDescribe] Done ({len(desc.split())} words).")
+    return desc
 
 
 # -- Negative prompt builder --
@@ -598,220 +614,251 @@ def _build_neg(result, user_input):
     return ", ".join([_NEG_BASE] + extras)
 
 
-class EasyPromptEngine:
+# -- EasyPrompt: ComfyUI LTX2PromptArchitect node wrapper (with standalone fallback) --
+
+_LLM_LABEL_MAP = {
+    "8B":  "8B - NeuralDaredevil (High Quality)",
+    "3B":  "3B - Llama-3.2 Abliterated (Low VRAM)",
+    "14B": "14B - Qwen3 Abliterated (High VRAM)",
+}
+
+_CREATIVITY_MAP = {
+    0.7: "0.7 - Literal & Grounded",
+    0.9: "0.9 - Balanced Professional",
+    1.1: "1.1 - Artistic Expansion",
+}
+
+_MANDATORY_KEYWORDS = (
+    "Ultra HDR, 3D intricate details, vibrant colors, realistic lighting, "
+    "Dramatic Lighting, Enhanced Clarity, Brilliant Highlights, "
+    "Hyperrealistic Detailing, cinematic"
+)
+
+_EASY_PROMPT_CLEAN_RE = [
+    (re.compile(r"<think>.*?</think>", re.DOTALL), ""),
+    (re.compile(r"^(Sure!?|Certainly!?|Here(?:'s| is).*?:)[^\n]*\n?", re.IGNORECASE), ""),
+    (re.compile(r"\s*(assistant|user|system|<\|[^|>]*\|>)\s*$", re.IGNORECASE), ""),
+    (re.compile(r"\s*\n+Note:.*$", re.DOTALL), ""),
+    (re.compile(r"\s*\(Note:.*$", re.DOTALL | re.IGNORECASE), ""),
+    (re.compile(r"\s*(\([^)]{5,120}\)\s*){2,}$", re.DOTALL), ""),
+    (re.compile(r"\s*\n+(Please let me know|Let me revise|Confirmed\.|Output ends|"
+                r"Done\.|I hope|Thank you|No further).*$",
+                re.DOTALL | re.IGNORECASE), ""),
+    (re.compile(r"\n{3,}"), "\n\n"),
+]
+
+_EASY_PROMPT_SYSTEM = (
+    "You are a cinematic prompt writer for LTX-2, an AI video generation model. "
+    "Expand the user's idea into a rich, video-ready prompt.\n\n"
+    "PRIORITY ORDER:\n"
+    "1. Video style & genre\n"
+    "2. Camera angle & shot type\n"
+    "3. Character description (age MUST be a specific number)\n"
+    "4. Scene & environment\n"
+    "5. Action & motion (continuous present-tense)\n"
+    "6. Camera movement (prose only, no brackets)\n"
+    "7. Audio (max 2 ambient sounds, dialogue as inline prose)\n\n"
+    "RULES:\n"
+    "- Present tense throughout.\n"
+    "- 8-12 sentences of dense flowing prose.\n"
+    "- Fill the full token budget. Do not stop early.\n"
+    "- Output ONLY the expanded prompt. No preamble."
+)
+
+_EASY_PROMPT_MODELS_HF = {
+    "8B": "mlabonne/NeuralDaredevil-8B-abliterated",
+    "3B": "huihui-ai/Llama-3.2-3B-Instruct-abliterated",
+    "14B": "huihui-ai/Huihui-Qwen3-14B-abliterated-v2",
+}
+
+
+def _creativity_label(c):
+    """Map a numeric creativity value to the node's expected label string."""
+    closest = min(_CREATIVITY_MAP.keys(), key=lambda x: abs(x - c))
+    return _CREATIVITY_MAP[closest]
+
+
+def _clean_prompt(text):
+    """Clean up LLM output artifacts."""
+    text = text.strip()
+    for pattern, repl in _EASY_PROMPT_CLEAN_RE:
+        text = pattern.sub(repl, text)
+    text = re.sub(r"\s*[\(\[]\s*$", "", text)
+    return text.strip()
+
+
+def run_easy_prompt(user_input, frame_count=121, seed=-1,
+                    scene_context="", lora_triggers="",
+                    llm_model="3B", creativity=0.9,
+                    character_bible=""):
     """
-    Expands a simple story beat into a dense cinematic LTX-2 prompt.
-    Loads the LLM, generates, cleans output, then unloads to free VRAM.
+    Calls LTX2PromptArchitect ComfyUI node to expand a story beat into a dense
+    cinematic prompt. Falls back to standalone LLM if the node is missing.
+    Appends mandatory keywords to the result.
+
+    Returns: (positive_prompt, negative_prompt)
     """
+    _vram_guard(min_free_gb=4.0)
 
-    MODELS = {
-        "8B": "mlabonne/NeuralDaredevil-8B-abliterated",
-        "3B": "huihui-ai/Llama-3.2-3B-Instruct-abliterated",
-        "14B": "huihui-ai/Huihui-Qwen3-14B-abliterated-v2",
-    }
+    # --- Primary path: ComfyUI LTX2PromptArchitect node ---
+    if "LTX2PromptArchitect" in NODE_CLASS_MAPPINGS:
+        # Prepend character bible to scene_context so the node sees it
+        effective_context = scene_context
+        if character_bible.strip():
+            effective_context = (
+                "[CHARACTER BIBLE - NON-NEGOTIABLE: Every character attribute below "
+                "MUST remain exactly as described. Do NOT alter hair, age, skin, "
+                "clothing, or any other attribute.]\n"
+                + character_bible.strip() + "\n\n" + scene_context
+            )
 
-    SYSTEM_PROMPT = (
-        "You are a cinematic prompt writer for LTX-2, an AI video generation model. "
-        "Expand the user's idea into a rich, video-ready prompt.\n\n"
-        "PRIORITY ORDER:\n"
-        "1. Video style & genre\n"
-        "2. Camera angle & shot type\n"
-        "3. Character description (age MUST be a specific number)\n"
-        "4. Scene & environment\n"
-        "5. Action & motion (continuous present-tense)\n"
-        "6. Camera movement (prose only, no brackets)\n"
-        "7. Audio (max 2 ambient sounds, dialogue as inline prose)\n\n"
-        "RULES:\n"
-        "- Present tense throughout.\n"
-        "- 8-12 sentences of dense flowing prose.\n"
-        "- Fill the full token budget. Do not stop early.\n"
-        "- Output ONLY the expanded prompt. No preamble."
-    )
+        print(f"   [EasyPrompt] LLM={llm_model} | creativity={creativity} | frames={frame_count}")
+        node = NODE_CLASS_MAPPINGS["LTX2PromptArchitect"]()
+        result = node.generate(
+            bypass=False,
+            user_input=user_input,
+            creativity=_creativity_label(creativity),
+            seed=seed,
+            invent_dialogue=True,
+            keep_model_loaded=False,
+            offline_mode=False,
+            frame_count=frame_count,
+            model=_LLM_LABEL_MAP.get(llm_model, "3B - Llama-3.2 Abliterated (Low VRAM)"),
+            local_path_8b="",
+            local_path_3b="",
+            local_path_14b="",
+            scene_context=effective_context,
+            lora_triggers=lora_triggers,
+        )
+        prompt = result[0]       # PROMPT output
+        neg_prompt = result[2]   # NEG_PROMPT output
+        # Append mandatory keywords
+        prompt = prompt.rstrip(". ") + ". " + _MANDATORY_KEYWORDS
+        print(f"   [EasyPrompt] Done ({len(prompt.split())} words).")
+        aggressive_cleanup("EasyPrompt done")
+        return prompt, neg_prompt
 
-    _CLEAN_RE = [
-        (re.compile(r"<think>.*?</think>", re.DOTALL), ""),
-        (re.compile(r"^(Sure!?|Certainly!?|Here(?:'s| is).*?:)[^\n]*\n?", re.IGNORECASE), ""),
-        (re.compile(r"\s*(assistant|user|system|<\|[^|>]*\|>)\s*$", re.IGNORECASE), ""),
-        (re.compile(r"\s*\n+Note:.*$", re.DOTALL), ""),
-        (re.compile(r"\s*\(Note:.*$", re.DOTALL | re.IGNORECASE), ""),
-        (re.compile(r"\s*(\([^)]{5,120}\)\s*){2,}$", re.DOTALL), ""),
-        (re.compile(r"\s*\n+(Please let me know|Let me revise|Confirmed\.|Output ends|"
-                    r"Done\.|I hope|Thank you|No further).*$",
-                    re.DOTALL | re.IGNORECASE), ""),
-        (re.compile(r"\n{3,}"), "\n\n"),
+    # --- Fallback: standalone LLM ---
+    print("   [EasyPrompt] LTX2PromptArchitect node not found, using standalone fallback.")
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from huggingface_hub import snapshot_download
+
+    hf_id = _EASY_PROMPT_MODELS_HF.get(llm_model, _EASY_PROMPT_MODELS_HF["3B"])
+    os.environ.pop("TRANSFORMERS_OFFLINE", None)
+    try:
+        source = snapshot_download(hf_id)
+    except Exception:
+        source = hf_id
+
+    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    print(f"   [EasyPrompt] Loading {llm_model} (standalone)...")
+    tok = AutoTokenizer.from_pretrained(source)
+    model = AutoModelForCausalLM.from_pretrained(
+        source, device_map="auto", torch_dtype=dtype, trust_remote_code=True)
+    model.config.use_cache = True
+    model.eval()
+
+    real_seconds = frame_count / 25.0
+    action_count = max(1, min(10, round(real_seconds / 4)))
+    token_budget = max(256, min(1200, action_count * 120))
+    max_tokens = int(token_budget * 1.05)
+    min_tokens = int(token_budget * 0.75)
+
+    if seed != -1:
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+
+    ordinal = {2: "2nd", 3: "3rd"}.get(action_count, f"{action_count}th")
+    if action_count > 1:
+        pacing = (
+            f"This clip is {real_seconds:.0f}s. Write EXACTLY {action_count} "
+            f"distinct actions. HARD STOP after the {ordinal} action. "
+            f"Write ~{token_budget} tokens."
+        )
+    else:
+        pacing = (
+            f"This clip is {real_seconds:.0f}s. Write EXACTLY 1 action. "
+            f"HARD STOP after it. ~{token_budget} tokens."
+        )
+
+    bible_clause = ""
+    if character_bible.strip():
+        bible_clause = (
+            f"\n[CHARACTER BIBLE - NON-NEGOTIABLE: Every character attribute below "
+            f"MUST remain exactly as described. Do NOT alter hair, age, skin, "
+            f"clothing, or any other attribute. This overrides any inference:\n"
+            f"{character_bible.strip()}\n]"
+        )
+
+    if scene_context.strip():
+        effective = (
+            f"[SCENE CONTEXT FROM IMAGE - authoritative]\n"
+            f"{scene_context.strip()}\n\n"
+            f"[USER DIRECTION]\n{user_input.strip()}"
+        )
+    else:
+        effective = user_input.strip()
+
+    lora_clause = (f"\n[LORA: Begin prompt with: {lora_triggers.strip()}]"
+                   if lora_triggers.strip() else "")
+
+    user_content = effective + bible_clause + lora_clause + f"\n[PACING: {pacing}]"
+    messages = [
+        {"role": "system", "content": _EASY_PROMPT_SYSTEM},
+        {"role": "user", "content": user_content},
     ]
 
-    def __init__(self, model_size="8B", offline=False, keep_loaded=False):
-        self.model_size = model_size
-        self.offline = offline
-        self.keep_loaded = keep_loaded
-        self._tok = None
-        self._model = None
-        self._loaded_key = None
+    is_qwen3 = "Qwen3" in _EASY_PROMPT_MODELS_HF.get(llm_model, "")
+    template_kwargs = {"enable_thinking": False} if is_qwen3 else {}
+    raw = tok.apply_chat_template(
+        messages, return_tensors="pt", add_generation_prompt=True,
+        **template_kwargs)
 
-    def _load(self):
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-        from huggingface_hub import snapshot_download
-        key = self.model_size
-        if self._model is not None and self._loaded_key == key:
-            return
-        if self._model is not None:
-            self._unload()
-        _vram_guard(min_free_gb=4.0)
-        hf_id = self.MODELS[key]
-        if not self.offline:
-            os.environ.pop("TRANSFORMERS_OFFLINE", None)
-            try:
-                source = snapshot_download(hf_id)
-            except Exception:
-                source = hf_id
-        else:
-            os.environ["TRANSFORMERS_OFFLINE"] = "1"
-            source = hf_id
-        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-        print(f"   [EasyPrompt] Loading {key} ...")
-        self._tok = AutoTokenizer.from_pretrained(source, local_files_only=self.offline)
-        self._model = AutoModelForCausalLM.from_pretrained(
-            source, device_map="auto", torch_dtype=dtype,
-            trust_remote_code=True, local_files_only=self.offline)
-        self._model.config.use_cache = True
-        self._model.eval()
-        self._loaded_key = key
-        print(f"   [EasyPrompt] Loaded.")
+    if hasattr(raw, "input_ids"):
+        input_ids = raw.input_ids.to(model.device)
+    elif isinstance(raw, dict):
+        input_ids = raw["input_ids"].to(model.device)
+    elif isinstance(raw, list):
+        input_ids = torch.tensor([raw], dtype=torch.long).to(model.device)
+    else:
+        input_ids = raw.to(model.device)
 
-    def _unload(self):
-        if self._model is not None:
-            del self._model
-        self._model = None
-        self._tok = None
-        self._loaded_key = None
-        _vram_free()
-        print("   [EasyPrompt] VRAM cleared.")
+    input_len = input_ids.shape[1]
 
-    def _stop_ids(self):
-        delims = ["assistant", "user", "system", "<|eot_id|>", "<|end_of_turn|>",
-                  "<|im_end|>", "<end_of_turn>", "[/INST]", "### Human", "### Assistant"]
-        ids = [self._tok.eos_token_id]
-        for s in delims:
-            enc = self._tok.encode(s, add_special_tokens=False)
-            if enc and enc[0] not in ids:
-                ids.append(enc[0])
-        return [i for i in dict.fromkeys(ids) if i is not None]
+    # Stop IDs
+    delims = ["assistant", "user", "system", "<|eot_id|>", "<|end_of_turn|>",
+              "<|im_end|>", "<end_of_turn>", "[/INST]", "### Human", "### Assistant"]
+    stop_ids = [tok.eos_token_id]
+    for s in delims:
+        enc = tok.encode(s, add_special_tokens=False)
+        if enc and enc[0] not in stop_ids:
+            stop_ids.append(enc[0])
+    stop_ids = [i for i in dict.fromkeys(stop_ids) if i is not None]
 
-    @staticmethod
-    def _clean(text):
-        text = text.strip()
-        for pattern, repl in EasyPromptEngine._CLEAN_RE:
-            text = pattern.sub(repl, text)
-        text = re.sub(r"\s*[\(\[]\s*$", "", text)
-        return text.strip()
+    with torch.no_grad():
+        out = model.generate(
+            input_ids, min_new_tokens=min_tokens, max_new_tokens=max_tokens,
+            temperature=creativity, do_sample=True, top_k=40, top_p=0.9,
+            repetition_penalty=1.07, use_cache=True,
+            pad_token_id=tok.eos_token_id, eos_token_id=stop_ids)
 
-    def generate(self, user_input, frame_count=121, creativity=0.9,
-                 seed=-1, scene_context="", lora_triggers="",
-                 character_bible=""):
-        """
-        Returns (positive_prompt, negative_prompt).
+    result = tok.decode(out[0][input_len:], skip_special_tokens=True).strip()
+    result = _clean_prompt(result)
+    result = re.sub(r'\s*[\(\[]\s*$', '', result).strip()
+    # Append mandatory keywords
+    result = result.rstrip(". ") + ". " + _MANDATORY_KEYWORDS
+    neg = _build_neg(result, user_input)
 
-        character_bible is injected as a hard [CHARACTER BIBLE - NON-NEGOTIABLE]
-        block so the LLM cannot alter any locked attribute across clips.
-        """
-        self._load()
-
-        real_seconds = frame_count / 25.0
-        action_count = max(1, min(10, round(real_seconds / 4)))
-        token_budget = max(256, min(1200, action_count * 120))
-        max_tokens = int(token_budget * 1.05)
-        min_tokens = int(token_budget * 0.75)
-
-        if seed != -1:
-            torch.manual_seed(seed)
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed_all(seed)
-
-        # Pacing constraint
-        ordinal = {2: "2nd", 3: "3rd"}.get(action_count, f"{action_count}th")
-        if action_count > 1:
-            pacing = (
-                f"This clip is {real_seconds:.0f}s. Write EXACTLY {action_count} "
-                f"distinct actions. HARD STOP after the {ordinal} action. "
-                f"Write ~{token_budget} tokens."
-            )
-        else:
-            pacing = (
-                f"This clip is {real_seconds:.0f}s. Write EXACTLY 1 action. "
-                f"HARD STOP after it. ~{token_budget} tokens."
-            )
-
-        # Character bible lock
-        bible_clause = ""
-        if character_bible.strip():
-            bible_clause = (
-                f"\n[CHARACTER BIBLE - NON-NEGOTIABLE: Every character attribute below "
-                f"MUST remain exactly as described. Do NOT alter hair, age, skin, "
-                f"clothing, or any other attribute. This overrides any inference:\n"
-                f"{character_bible.strip()}\n]"
-            )
-
-        # Scene context
-        if scene_context.strip():
-            effective = (
-                f"[SCENE CONTEXT FROM IMAGE - authoritative]\n"
-                f"{scene_context.strip()}\n\n"
-                f"[USER DIRECTION]\n{user_input.strip()}"
-            )
-        else:
-            effective = user_input.strip()
-
-        # LoRA trigger injection
-        lora_clause = (f"\n[LORA: Begin prompt with: {lora_triggers.strip()}]"
-                       if lora_triggers.strip() else "")
-
-        user_content = effective + bible_clause + lora_clause + f"\n[PACING: {pacing}]"
-
-        messages = [
-            {"role": "system", "content": self.SYSTEM_PROMPT},
-            {"role": "user", "content": user_content},
-        ]
-
-        is_qwen3 = "Qwen3" in self.MODELS.get(self.model_size, "")
-        template_kwargs = {"enable_thinking": False} if is_qwen3 else {}
-        raw = self._tok.apply_chat_template(
-            messages, return_tensors="pt", add_generation_prompt=True,
-            **template_kwargs)
-
-        if hasattr(raw, "input_ids"):
-            input_ids = raw.input_ids.to(self._model.device)
-        elif isinstance(raw, dict):
-            input_ids = raw["input_ids"].to(self._model.device)
-        elif isinstance(raw, list):
-            input_ids = torch.tensor([raw], dtype=torch.long).to(self._model.device)
-        else:
-            input_ids = raw.to(self._model.device)
-
-        input_len = input_ids.shape[1]
-
-        with torch.no_grad():
-            out = self._model.generate(
-                input_ids, min_new_tokens=min_tokens, max_new_tokens=max_tokens,
-                temperature=creativity, do_sample=True, top_k=40, top_p=0.9,
-                repetition_penalty=1.07, use_cache=True,
-                pad_token_id=self._tok.eos_token_id,
-                eos_token_id=self._stop_ids())
-
-        result = self._tok.decode(out[0][input_len:], skip_special_tokens=True).strip()
-        result = self._clean(result)
-        result = re.sub(r'\s*[\(\[]\s*$', '', result).strip()
-        del out, input_ids
-        neg = _build_neg(result, user_input)
-
-        if not self.keep_loaded:
-            self._unload()
-
-        print(f"   [EasyPrompt] Done ({len(result.split())} words).")
-        return result, neg
+    del out, input_ids, model, tok
+    aggressive_cleanup("EasyPrompt fallback done")
+    print(f"   [EasyPrompt] Done ({len(result.split())} words).")
+    return result, neg
 
 
-print("Character Bible & Consistency System ready.")
+print("Character Bible & Prompt/Vision Engines ready.")
+print("   Functions: run_vision_describe(), run_easy_prompt()")
+print("   Class: CharacterBible")
 
 
 # ======================================================================
@@ -952,17 +999,20 @@ def build_shot_prompt_pro(shot, json_data, shot_index, prev_shot_success=True):
 
 
 def parse_storyboard_from_json(scene_json):
-    """Convert JSON scene schema into an ordered STORYBOARD list."""
+    """
+    Convert JSON scene schema into an ordered STORYBOARD list.
+    Each entry stores the raw action beat text so that run_easy_prompt()
+    can expand it during production (in the engine's run() loop).
+    """
     storyboard = []
     shots = scene_json.get("story_action", {}).get("shots", [])
 
     for idx, shot in enumerate(shots):
         prev_shot = shots[idx - 1] if idx > 0 else None
-        full_prompt = build_shot_prompt_pro(shot, scene_json, idx)
 
         storyboard.append({
             "id": f"shot_{idx + 1:02d}",
-            "prompt": full_prompt,
+            "raw_beat": shot.get("action", ""),
             "shot_data": shot,
             "prev_shot": prev_shot,
             "index": idx,
@@ -1266,6 +1316,36 @@ def _apply_loras(unet, lora_stack):
     return unet
 
 
+# -- Anchor latent encoder (SVI-Pro pattern) --
+
+def _encode_anchor_latent(anchor_tensor, vae, half_w, half_h):
+    """
+    Encode anchor frame as latent for SVI-Pro style consistency.
+    Resizes to match video latent spatial dims and VAEEncodes it.
+    Returns: anchor_samples latent dict.
+    """
+    # Resize anchor to half-res latent dimensions
+    if "ImageResizeKJv2" in NODE_CLASS_MAPPINGS:
+        ikj = NODE_CLASS_MAPPINGS["ImageResizeKJv2"]()
+        resized = get_value_at_index(ikj.resize(
+            image=anchor_tensor, width=half_w, height=half_h,
+            upscale_method="lanczos", keep_proportion="crop",
+            pad_color="0, 0, 0", crop_position="center",
+            divisible_by=32, device="cpu"), 0)
+    else:
+        # Fallback: use ResizeImageMaskNode
+        rimn = NODE_CLASS_MAPPINGS["ResizeImageMaskNode"]()
+        resized = get_value_at_index(rimn.EXECUTE_NORMALIZED(
+            input=anchor_tensor, scale_method="lanczos",
+            resize_type={"resize_type": "scale dimensions",
+                         "width": half_w, "height": half_h, "crop": "center"}), 0)
+
+    vae_enc = NODE_CLASS_MAPPINGS["VAEEncode"]()
+    anchor_latent = get_value_at_index(
+        vae_enc.encode(pixels=resized, vae=vae), 0)
+    return anchor_latent
+
+
 # -- generate_clip: Two-pass LTX-2 19B GGUF pipeline --
 
 def generate_clip(
@@ -1278,6 +1358,7 @@ def generate_clip(
     fps=24,
     seed=42,
     image_strength=1.0,
+    anchor_latent=None,
     pass1_sigmas="1., 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0",
     pass1_sampler="euler",
     pass1_cfg=1.0,
@@ -1303,6 +1384,11 @@ def generate_clip(
     Two-pass LTX-2 19B GGUF generation for one clip.
     T4-safe: CLIP is loaded, encodes text, then deleted before UNet loads.
     UNet is deleted after Pass 2, before decode.
+
+    anchor_latent: Optional pre-encoded latent from the previous clip's overlap
+        frame. When provided alongside image_tensor, the anchor_latent biases
+        the noise initialization toward the previous scene's appearance for
+        stronger inter-clip consistency (SVI-Pro pattern).
 
     Returns: output video file path.
     """
@@ -1410,6 +1496,35 @@ def generate_clip(
                 latent=get_value_at_index(vid_lat, 0)), 0),)
         else:
             vid_lat = (get_value_at_index(vid_lat, 0),)
+
+        # Anchor latent injection (SVI-Pro pattern):
+        # If anchor_latent is provided AND image_tensor is provided,
+        # LTXVImgToVideoInplace handles visual conditioning (first frame),
+        # and anchor_latent biases the noise initialization toward character
+        # appearance from the previous clip for stronger consistency.
+        if anchor_latent is not None and not img_bypass:
+            # Blend anchor_latent into the video latent starting samples
+            # to bias the diffusion toward the previous scene
+            try:
+                anchor_s = anchor_latent.get("samples", anchor_latent)
+                if isinstance(anchor_s, dict):
+                    anchor_s = anchor_s.get("samples", anchor_s)
+                if isinstance(anchor_s, torch.Tensor):
+                    vid_samples = vid_lat[0].get("samples", vid_lat[0])
+                    if isinstance(vid_samples, dict):
+                        vid_samples = vid_samples.get("samples", vid_samples)
+                    if isinstance(vid_samples, torch.Tensor):
+                        # Expand anchor to match temporal dim (repeat along frames)
+                        if anchor_s.ndim == 4 and vid_samples.ndim == 5:
+                            anchor_exp = anchor_s.unsqueeze(2).expand_as(vid_samples[:, :, :1, :, :])
+                            # Blend only the first frame's latent
+                            blend = 0.3 * img_str
+                            vid_samples[:, :, :1, :, :] = (
+                                (1 - blend) * vid_samples[:, :, :1, :, :] +
+                                blend * anchor_exp)
+                        print("   [Clip] Anchor latent injected (SVI-Pro)")
+            except Exception as e:
+                print(f"   [Clip] Anchor latent injection skipped ({e})")
 
         # Audio latent + concat AV
         elalat = NODE_CLASS_MAPPINGS["LTXVEmptyLatentAudio"]()
@@ -1540,11 +1655,13 @@ def generate_clip(
 class StudioProductionEngine:
     """
     Orchestrates the full LTX Studio production pipeline.
-    Iterates through shots from a scene JSON, using VisionDescribeEngine for
-    anchor analysis, EasyPromptEngine for prompt expansion with CharacterBible lock,
-    generate_clip() for rendering, and last-frame chaining between shots.
+    Iterates through shots from a scene JSON, using run_vision_describe() for
+    anchor analysis, run_easy_prompt() for prompt expansion with CharacterBible lock,
+    generate_clip() for rendering, and SVI-Pro anchor chaining between shots.
 
     Features:
+    - SVI-Pro anchor frame extraction at OVERLAP_FRAMES position
+    - Anchor latent encoding for latent-space consistency
     - Adaptive anchor strength per shot
     - Retry logic (max 3 attempts with seed variation)
     - Cache-based resume (saves each clip to disk)
@@ -1552,11 +1669,8 @@ class StudioProductionEngine:
     - Final video stitching via ffmpeg
     """
 
-    def __init__(self, character_bible=None, vision_engine=None,
-                 prompt_engine=None, scene_json=None, config=None):
+    def __init__(self, character_bible=None, scene_json=None, config=None):
         self.bible = character_bible or CharacterBible()
-        self.vision = vision_engine or VisionDescribeEngine("3B-fast")
-        self.prompt_engine = prompt_engine or EasyPromptEngine("8B")
         self.scene_json = scene_json or {}
         self.config = config or {}
 
@@ -1573,7 +1687,10 @@ class StudioProductionEngine:
         self.use_voice_sync = self.config.get("USE_VOICE_SYNC", True)
         self.anchor_high = self.config.get("ANCHOR_STRENGTH_HIGH", 0.85)
         self.anchor_low = self.config.get("ANCHOR_STRENGTH_LOW", 0.70)
+        self.overlap_frames = self.config.get("OVERLAP_FRAMES", 16)
         self.creativity = self.config.get("CREATIVITY", 0.9)
+        self.llm_model = self.config.get("LLM_MODEL", "3B")
+        self.vision_model = self.config.get("VISION_MODEL", "3B-fast")
         self.seed_image_path = self.config.get("SEED_IMAGE_PATH", None)
         self.project_name = self.config.get("PROJECT_NAME", "LTX_Studio")
         self.output_dir = self.config.get("OUTPUT_DIR", "/content/ComfyUI/output")
@@ -1586,7 +1703,8 @@ class StudioProductionEngine:
     def run(self):
         """
         Main production loop. Iterates through all shots in the storyboard,
-        generating clips with retry logic and scene chaining.
+        generating clips with retry logic and SVI-Pro anchor chaining.
+        Uses run_easy_prompt() to expand each raw beat into a full cinematic prompt.
         Returns list of output paths (None for failed shots).
         """
         storyboard = parse_storyboard_from_json(self.scene_json)
@@ -1601,6 +1719,7 @@ class StudioProductionEngine:
 
         outputs = []
         current_image = None
+        current_anchor_latent = None
         prev_shot_success = True
 
         # Load seed image if provided
@@ -1611,7 +1730,7 @@ class StudioProductionEngine:
             # Auto-populate CharacterBible from seed image
             if not self.bible.has_characters() and self.use_vision:
                 print("[Studio] Extracting character from seed image...")
-                desc = self.vision.describe(current_image)
+                desc = run_vision_describe(current_image, model_key=self.vision_model)
                 _vram_free()
                 self.bible.extract_from_description("Main Character", desc)
 
@@ -1622,8 +1741,12 @@ class StudioProductionEngine:
             if os.path.exists(cached_clip):
                 outputs.append(cached_clip)
                 start_index = i + 1
-                lf = get_last_frame_tensor(cached_clip)
-                if lf is not None:
+                # Extract anchor frame from the OVERLAP_FRAMES position
+                anchor_path = self._extract_overlap_anchor(cached_clip, input_dir, i)
+                if anchor_path:
+                    current_image = load_image_tensor(anchor_path)
+                else:
+                    lf = get_last_frame_tensor(cached_clip)
                     current_image = lf
             else:
                 break
@@ -1647,7 +1770,7 @@ class StudioProductionEngine:
             print(f"\n[Studio] --- Shot {shot_num}/{len(storyboard)} ---")
             print(f"[Studio] {shot_data.get('action', '')[:80]}...")
 
-            # Calculate adaptive strength
+            # Calculate adaptive strength based on motion change between scenes
             if self.use_adaptive_strength and i > 0:
                 strength = calculate_adaptive_strength(
                     shot_data, entry.get("prev_shot"),
@@ -1661,27 +1784,31 @@ class StudioProductionEngine:
             if i > 0 and current_image is not None and self.use_vision:
                 print(f"   [Studio] Vision Describe on anchor...")
                 try:
-                    scene_ctx = self.vision.describe(current_image)
+                    scene_ctx = run_vision_describe(
+                        current_image, model_key=self.vision_model)
                     _vram_free()
                 except Exception as e:
                     print(f"   [Studio] Vision failed ({e}), continuing without context")
 
-            # EasyPrompt expand with CharacterBible lock
+            # EasyPrompt expand: use run_easy_prompt() to expand raw beat
             print(f"   [Studio] EasyPrompt expand...")
             beat_seed = self.base_seed + i * 1000
+            raw_beat = entry.get("raw_beat", shot_data.get("action", ""))
             try:
-                expanded_prompt, neg_prompt = self.prompt_engine.generate(
-                    user_input=shot_data.get("action", ""),
+                expanded_prompt, neg_prompt = run_easy_prompt(
+                    user_input=raw_beat,
                     frame_count=self.frames,
-                    creativity=self.creativity,
                     seed=beat_seed,
                     scene_context=scene_ctx,
+                    llm_model=self.llm_model,
+                    creativity=self.creativity,
                     character_bible=self.bible.to_prompt_block(),
                 )
                 _vram_free()
             except Exception as e:
-                print(f"   [Studio] EasyPrompt failed ({e}), using raw prompt")
-                expanded_prompt = entry["prompt"]
+                print(f"   [Studio] EasyPrompt failed ({e}), using raw beat + scene context")
+                expanded_prompt = build_shot_prompt_pro(
+                    shot_data, self.scene_json, i)
                 neg_prompt = build_negative_prompt_enhanced()
 
             print(f"   [Studio] Prompt: {expanded_prompt[:120]}...")
@@ -1720,6 +1847,7 @@ class StudioProductionEngine:
                         fps=self.fps,
                         seed=current_seed,
                         image_strength=strength,
+                        anchor_latent=current_anchor_latent,
                         use_tiled_vae=retry_tiled,
                         lora_stack=lora_stack,
                         output_prefix=f"{self.project_name}_{shot_num:02d}",
@@ -1753,15 +1881,24 @@ class StudioProductionEngine:
                 outputs.append(cached_path)
                 prev_shot_success = True
 
-                # Enhanced anchor extraction for next shot
-                anchor_path = enhanced_anchor_extraction(
-                    cached_path, output_folder=input_dir,
-                    scene_idx=i, overlap=16)
+                # SVI-Pro anchor chaining: extract frame at OVERLAP_FRAMES position
+                anchor_path = self._extract_overlap_anchor(
+                    cached_path, input_dir, i)
                 if anchor_path:
                     current_image = load_image_tensor(anchor_path)
+                    # Optionally VAEEncode the anchor for latent-space consistency
+                    try:
+                        half_w = self.width // 2
+                        half_h = self.height // 2
+                        current_anchor_latent = self._try_encode_anchor(
+                            current_image, half_w, half_h)
+                    except Exception as e:
+                        print(f"   [Studio] Anchor latent encode skipped ({e})")
+                        current_anchor_latent = None
                 else:
                     lf = get_last_frame_tensor(cached_path)
                     current_image = lf
+                    current_anchor_latent = None
 
                 print(f"   [Studio] Shot {shot_num} DONE")
 
@@ -1772,6 +1909,7 @@ class StudioProductionEngine:
                 self._failed_shots.append(shot_num)
                 prev_shot_success = False
                 current_image = None
+                current_anchor_latent = None
                 print(f"   [Studio] Shot {shot_num} FAILED after {max_retries} attempts")
 
             # Progress tracking
@@ -1805,6 +1943,40 @@ class StudioProductionEngine:
             print(f"[Studio] Output: {final_path}")
 
         return outputs
+
+    def _extract_overlap_anchor(self, video_path, output_folder, scene_idx):
+        """
+        Extract anchor frame at the OVERLAP_FRAMES position from end of video.
+        Uses enhanced_anchor_extraction with the configured overlap value.
+        This is the SVI-Pro chaining pattern: the anchor is taken from the
+        overlap region, not just the last frame.
+        """
+        return enhanced_anchor_extraction(
+            video_path, output_folder=output_folder,
+            scene_idx=scene_idx, overlap=self.overlap_frames)
+
+    def _try_encode_anchor(self, anchor_tensor, half_w, half_h):
+        """
+        Attempt to VAEEncode the anchor frame into a latent for SVI-Pro
+        latent-space consistency. Loads VAE temporarily, encodes, frees it.
+        Returns anchor_latent dict or None on failure.
+        """
+        if anchor_tensor is None:
+            return None
+        if "VAELoader" not in NODE_CLASS_MAPPINGS:
+            return None
+        try:
+            vae_ld = NODE_CLASS_MAPPINGS["VAELoader"]()
+            vae_v = get_value_at_index(vae_ld.load_vae(
+                vae_name="LTX2_video_vae_bf16.safetensors"), 0)
+            anchor_latent = _encode_anchor_latent(anchor_tensor, vae_v, half_w, half_h)
+            del vae_v
+            _vram_free()
+            return anchor_latent
+        except Exception as e:
+            print(f"   [Studio] Anchor encode failed ({e})")
+            _vram_free()
+            return None
 
     def get_clip_paths(self):
         """Return list of successfully generated clip paths."""
@@ -2002,9 +2174,6 @@ print(f"   Example storyboard: {num_example_shots} shots")
 # -- Instantiate engines --
 bible = CharacterBible()
 
-vision_engine = VisionDescribeEngine(model_key=VISION_MODEL)
-prompt_engine = EasyPromptEngine(model_size=LLM_MODEL, keep_loaded=False)
-
 # -- Build configuration dict --
 production_config = {
     "PROJECT_NAME": PROJECT_NAME,
@@ -2021,7 +2190,10 @@ production_config = {
     "USE_CHARACTER_LORAS": USE_CHARACTER_LORAS,
     "ANCHOR_STRENGTH_HIGH": ANCHOR_STRENGTH_HIGH,
     "ANCHOR_STRENGTH_LOW": ANCHOR_STRENGTH_LOW,
+    "OVERLAP_FRAMES": OVERLAP_FRAMES,
     "CREATIVITY": CREATIVITY,
+    "LLM_MODEL": LLM_MODEL,
+    "VISION_MODEL": VISION_MODEL,
     "SEED_IMAGE_PATH": SEED_IMAGE_PATH,
     "SHOW_PREVIEWS": SHOW_PREVIEWS,
     "DOWNLOAD_AFTER_GENERATE": DOWNLOAD_AFTER_GENERATE,
@@ -2038,8 +2210,6 @@ production_config = {
 # -- Instantiate production engine --
 engine = StudioProductionEngine(
     character_bible=bible,
-    vision_engine=vision_engine,
-    prompt_engine=prompt_engine,
     scene_json=EXAMPLE_SCENE_JSON,
     config=production_config,
 )
