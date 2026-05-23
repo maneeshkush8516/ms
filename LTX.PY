@@ -149,10 +149,10 @@ print("-- Core model downloads --")
 # UNet: GGUF Q4_K_M distilled
 _M_UNET = _dl(f"{KIJAI}/diffusion_models/ltx-2-19b-distilled_Q4_K_M.gguf", UNET_D)
 
-# Text encoders - Gemma fp4 (RTX 5000 Blackwell; use fp8 for T4/A100)
-_M_CLIP1 = _dl(f"{COMFYORG}/text_encoders/gemma_3_12B_it_fp4_mixed.safetensors", TE_D)
-# fp8 alternative for T4:
-# _M_CLIP1 = _dl(f"{COMFYORG}/text_encoders/gemma_3_12B_it_fp8_scaled.safetensors", TE_D)
+# Text encoders - Gemma fp8 (T4/A100 default)
+_M_CLIP1 = _dl(f"{COMFYORG}/text_encoders/gemma_3_12B_it_fp8_scaled.safetensors", TE_D)
+# fp4 alternative for RTX 5000 Blackwell GPUs (higher quality, requires Blackwell):
+# _M_CLIP1 = _dl(f"{COMFYORG}/text_encoders/gemma_3_12B_it_fp4_mixed.safetensors", TE_D)
 
 # Embeddings connector (distilled)
 _M_CLIP2 = _dl(
@@ -1335,7 +1335,7 @@ def generate_clip(
     lora_stack: Optional[List[Dict]] = None,
     output_prefix: str = "IFE",
     unet_model: str = "ltx-2-19b-distilled_Q4_K_M.gguf",
-    clip_name1: str = "gemma_3_12B_it_fp4_mixed.safetensors",
+    clip_name1: str = "gemma_3_12B_it_fp8_scaled.safetensors",
     clip_name2: str = "ltx-2-19b-embeddings_connector_distill_bf16.safetensors",
     vae_model: str = "LTX2_video_vae_bf16.safetensors",
     vae_audio_model: str = "LTX2_audio_vae_bf16.safetensors",
@@ -1388,14 +1388,18 @@ def generate_clip(
         cte = NODE_CLASS_MAPPINGS["CLIPTextEncode"]()
         cond_pos = cte.encode(text=prompt, clip=clip_raw)
 
-        zero_out = NODE_CLASS_MAPPINGS["ConditioningZeroOut"]()
-        cond_0 = zero_out.zero_out(conditioning=get_value_at_index(cond_pos, 0))
+        # Encode negative prompt if provided; fall back to zero-out for empty neg_prompt
+        if neg_prompt and neg_prompt.strip():
+            cond_neg = cte.encode(text=neg_prompt, clip=clip_raw)
+        else:
+            zero_out = NODE_CLASS_MAPPINGS["ConditioningZeroOut"]()
+            cond_neg = zero_out.zero_out(conditioning=get_value_at_index(cond_pos, 0))
 
         ltxv_cn = NODE_CLASS_MAPPINGS["LTXVConditioning"]()
         cond = ltxv_cn.EXECUTE_NORMALIZED(
             frame_rate=float(fps),
             positive=get_value_at_index(cond_pos, 0),
-            negative=get_value_at_index(cond_0, 0))
+            negative=get_value_at_index(cond_neg, 0))
 
         # DELETE CLIP - frees ~6-8 GB for UNet
         del clip_raw
@@ -1416,13 +1420,13 @@ def generate_clip(
         _vram_print("UNet + LoRAs loaded")
 
         # ============================================================
-        # STEP 3: Load VAEs + upscaler
+        # STEP 3: Load VAEs (VAE must co-reside with UNet because
+        # LTXVImgToVideoInplace in Step 4 requires vae for I2V conditioning.
+        # Audio VAE is small (~0.5 GB). Upscaler deferred to after Pass 1.)
         # ============================================================
         vae_ld = NODE_CLASS_MAPPINGS["VAELoader"]()
         vae_v = get_value_at_index(vae_ld.load_vae(vae_name=vae_model), 0)
         vae_a = get_value_at_index(_audio_vae(vae_audio_model), 0)
-        uml = NODE_CLASS_MAPPINGS["LatentUpscaleModelLoader"]()
-        up_mdl = get_value_at_index(uml.EXECUTE_NORMALIZED(model_name=upscaler_model), 0)
 
         # ============================================================
         # STEP 4: Prepare latents
@@ -1501,8 +1505,12 @@ def generate_clip(
 
         # ============================================================
         # STEP 6: Pass 2 (LTXVLatentUpsampler 2x + gradient_estimation)
+        # Load upscaler here (deferred from Step 3 to reduce peak VRAM)
         # ============================================================
         print("   [Clip] Pass 2 (upscale + refine)...")
+        uml = NODE_CLASS_MAPPINGS["LatentUpscaleModelLoader"]()
+        up_mdl = get_value_at_index(uml.EXECUTE_NORMALIZED(model_name=upscaler_model), 0)
+
         sep = NODE_CLASS_MAPPINGS["LTXVSeparateAVLatent"]()
         s1 = sep.EXECUTE_NORMALIZED(av_latent=p1_av)
         vl1, al1 = get_value_at_index(s1, 0), get_value_at_index(s1, 1)
@@ -1683,8 +1691,8 @@ def parse_story_to_scenes(story_text: str, prompt_engine: EasyPromptEngine,
                           bible: CharacterBible, num_scenes: int = 12) -> List[Dict]:
     """
     Parse a story description into individual scene beats using EasyPromptEngine.
-    Each scene gets a camera movement, motion intensity, and expanded prompt
-    with character bible lock and mandatory keywords.
+    Splits story by sentence boundaries, then uses the prompt engine to expand
+    each beat into a full cinematic prompt with character bible lock.
 
     Args:
         story_text: Raw story description
@@ -1711,25 +1719,49 @@ def parse_story_to_scenes(story_text: str, prompt_engine: EasyPromptEngine,
     story_lines = [l.strip() for l in story_text.strip().split("\n") if l.strip()]
     story_combined = " ".join(story_lines)
 
-    # Simple scene splitting: divide story into roughly equal parts
-    words = story_combined.split()
-    words_per_scene = max(5, len(words) // num_scenes)
+    # Split by sentence boundaries (period followed by space or end of string)
+    sentences = [s.strip() for s in re.split(r'(?<=\.)\s+', story_combined) if s.strip()]
+    # Remove empty trailing sentences from split artifacts
+    sentences = [s for s in sentences if len(s) > 2]
 
-    scene_beats = []
-    for i in range(num_scenes):
-        start = i * words_per_scene
-        end = start + words_per_scene if i < num_scenes - 1 else len(words)
-        beat = " ".join(words[start:end])
-        if beat.strip():
-            scene_beats.append(beat)
+    # Distribute sentences across target number of scenes
+    if len(sentences) <= num_scenes:
+        scene_beats = sentences[:]
+    else:
+        # Group sentences into num_scenes chunks
+        sents_per_scene = max(1, len(sentences) // num_scenes)
+        scene_beats = []
+        for i in range(num_scenes):
+            start = i * sents_per_scene
+            end = start + sents_per_scene if i < num_scenes - 1 else len(sentences)
+            beat = " ".join(sentences[start:end])
+            if beat.strip():
+                scene_beats.append(beat)
 
     # If we got fewer beats than requested, pad with repetitions
     while len(scene_beats) < num_scenes:
         scene_beats.append(scene_beats[-1] if scene_beats else story_combined)
 
+    # Expand each beat via EasyPromptEngine for cinematic prompts
     for idx, beat in enumerate(scene_beats[:num_scenes]):
         cam_idx = idx % len(camera_sequence)
         motion_idx = idx % len(motion_curve)
+
+        # Use EasyPromptEngine to expand the scene beat into a full prompt
+        try:
+            expanded, neg = prompt_engine.generate(
+                user_input=beat,
+                frame_count=121,
+                creativity=0.9,
+                seed=42 + idx * 1000,
+                scene_context="",
+                character_bible=bible.to_prompt_block(),
+            )
+            _vram_free()
+        except Exception as e:
+            print(f"   [parse_story] EasyPrompt failed for scene {idx} ({e}), using raw beat")
+            expanded = beat.rstrip(".") + ". " + _MANDATORY_KEYWORDS
+            neg = _NEG_BASE
 
         shot_data = {
             "action": beat,
@@ -1740,7 +1772,7 @@ def parse_story_to_scenes(story_text: str, prompt_engine: EasyPromptEngine,
         }
 
         scenes.append({
-            "prompt": beat,
+            "prompt": expanded,
             "beat": beat,
             "camera_movement": camera_sequence[cam_idx],
             "motion_intensity": motion_curve[motion_idx],
