@@ -1,0 +1,31 @@
+{
+  "id": "FEAT-001",
+  "type": "fix",
+  "description": "Restructure generate_pro() model loading order and add per-stage VAE loading to prevent OOM on T4. Add aggressive_cleanup() helper function. This is the core fix that addresses Fixes 1, 2, and 3 from the requirements.",
+  "status": "in_progress",
+  "steps": [
+    "Step 1: Add the aggressive_cleanup() helper function right after the existing cleanup_memory() function (around line 260). The function should include gc.collect(), torch.cuda.synchronize(), torch.cuda.empty_cache(), torch.cuda.ipc_collect(), and a second gc.collect(). Accept a label parameter and call _print_vram(label) if label is provided. Also update the existing cleanup_memory() to call torch.cuda.synchronize() BEFORE torch.cuda.empty_cache() (currently it's after).",
+    "Step 2: Restructure the PHASE 1 and PHASE 2 sections of generate_pro() to follow this order: (a) Load CLIP via DualCLIPLoader, (b) Encode text (CLIPTextEncode positive, negative, ConditioningZeroOut, LTXVConditioning), (c) DELETE clip_model and call aggressive_cleanup('CLIP deleted'), (d) THEN load UNet via UnetLoaderGGUF, (e) Apply LoRA stack (note: pass None for clip_model since IC/camera LoRAs don't modify CLIP - this matches the pattern in LTX2_InfiniteFlow_12Scene.py where _apply_loras is called with _dummy_clip=None), (f) Apply sage attention and chunk FF patches.",
+    "Step 3: Change VAE loading to per-stage pattern. Remove the single vae_video load that currently happens in Phase 1. Instead: (a) For I2V conditioning in Phase 4: load VAE fresh, use it for LTXVImgToVideoInplace, then del it and call aggressive_cleanup('VAE I2V done'). (b) For character anchor encoding: load VAE fresh, use it for VAEEncode, then del it and call aggressive_cleanup('VAE anchor done'). (c) For Pass 2 upsampling (LTXVLatentUpsampler): load VAE fresh, use it, then del both VAE and upscale_model and call aggressive_cleanup('VAE upscale done'). (d) For Phase 8 decode: load VAE fresh, use it for tiled/standard decode, then del it and call aggressive_cleanup('VAE decode done'). The upscaler model (LatentUpscaleModelLoader) should be loaded just before Pass 2 when it's needed, not in Phase 1.",
+    "Step 4: After Pass 1 completes, delete the guider AND call aggressive_cleanup('Pass 1 done'). After Pass 2 completes, delete guider_p2 AND unet AND call aggressive_cleanup('Pass 2 done - UNet freed').",
+    "Step 5: Move audio VAE loading to right before the audio latent is needed (before LTXVEmptyLatentAudio). Keep audio VAE through audio decode, then del it after audio decode. The audio VAE is small (~1GB) so no need to reload it per-stage.",
+    "Step 6: Ensure the function signature and return value remain exactly the same. All the same ComfyUI node calls must still happen - only the order of model load/unload changes."
+  ],
+  "acceptance_criteria": [
+    "python -c \"import ast; ast.parse(open('/projects/sandbox/ms/LTX_PRO.py').read())\" passes without error",
+    "aggressive_cleanup() function is defined and includes torch.cuda.synchronize(), torch.cuda.empty_cache(), torch.cuda.ipc_collect()",
+    "In generate_pro(), CLIP is loaded, text is encoded, then CLIP is deleted BEFORE UNet is loaded",
+    "VAE is loaded fresh for each stage (I2V conditioning, upsampling, decode) and deleted after each use",
+    "UNet is deleted after Pass 2 completes (before decode phase)",
+    "generate_pro() function signature is unchanged",
+    "All existing ComfyUI node calls (UnetLoaderGGUF, DualCLIPLoader, CLIPTextEncode, LTXVConditioning, VAELoader, LTXVImgToVideoInplace, LTXVLatentUpsampler, LTXVSpatioTemporalTiledVAEDecode, etc.) are still present"
+  ],
+  "verification": [
+    "Run: python -c \"import ast; ast.parse(open('/projects/sandbox/ms/LTX_PRO.py').read()); print('Syntax OK')\"",
+    "Run: grep -n 'def aggressive_cleanup' /projects/sandbox/ms/LTX_PRO.py",
+    "Run: grep -n 'def generate_pro' /projects/sandbox/ms/LTX_PRO.py to confirm function still exists",
+    "Run: python -c \"import ast; tree=ast.parse(open('/projects/sandbox/ms/LTX_PRO.py').read()); funcs=[n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]; assert 'generate_pro' in funcs; assert 'aggressive_cleanup' in funcs; assert 'run_storyboard' in funcs; print('All key functions present')\""
+  ],
+  "blocked_reason": null,
+  "findings": ""
+}

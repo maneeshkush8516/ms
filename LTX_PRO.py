@@ -272,13 +272,24 @@ def cleanup_memory(verbose: bool = False) -> None:
     """Enhanced memory cleanup including ipc_collect for fragmentation."""
     gc.collect()
     if torch.cuda.is_available():
-        torch.cuda.empty_cache()
         torch.cuda.synchronize()
-        torch.cuda.ipc_collect()   # free IPC handles — reduces fragmentation
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()   # free IPC handles - reduces fragmentation
     if verbose:
         _print_vram()
 
-def _print_vram() -> None:
+def aggressive_cleanup(label: str = "") -> None:
+    """Aggressive VRAM cleanup: double gc + synchronize + empty_cache + ipc_collect."""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+    gc.collect()
+    if label:
+        _print_vram(label)
+
+def _print_vram(label: str = "") -> None:
     if not torch.cuda.is_available():
         return
     used  = torch.cuda.memory_allocated() / 1024**3
@@ -286,7 +297,8 @@ def _print_vram() -> None:
     pct   = used / total * 100 if total > 0 else 0
     filled = int(20 * used / total) if total > 0 else 0
     bar   = "█" * filled + "░" * (20 - filled)
-    print(f"   💾 VRAM [{bar}] {used:.1f}/{total:.1f} GB ({pct:.1f}%)")
+    tag   = f" [{label}]" if label else ""
+    print(f"   💾 VRAM [{bar}] {used:.1f}/{total:.1f} GB ({pct:.1f}%){tag}")
 
 # ── ComfyUI node output accessor ──────────────────────────────────────────────
 def get_value_at_index(obj: Union[Sequence, Mapping], index: int) -> Any:
@@ -1173,27 +1185,14 @@ def generate_pro(
     cleanup_memory(verbose=True)
 
     # ══════════════════════════════════════════════════════════════════════
-    # PHASE 1 — MODEL LOADING
+    # PHASE 1A - TEXT ENCODING (CLIP loaded, used, then freed before UNet)
     # ══════════════════════════════════════════════════════════════════════
 
     with torch.inference_mode():
 
-        # ── UNet: UnetLoaderGGUF ──────────────────────────────────────────
-        # [197] UnetLoaderGGUF in LD-I2V.json — loads GGUF Q4_K_M distilled
-        print("\n📦 Loading UNet (GGUF Q4_K_M distilled)…")
-        try:
-            unet_loader = NODE_CLASS_MAPPINGS["UnetLoaderGGUF"]()
-            unet        = get_value_at_index(
-                unet_loader.load_unet(unet_name=_unet), 0)
-        except KeyError:
-            raise RuntimeError(
-                "UnetLoaderGGUF not found.\n"
-                "  Fix: Run Cell 1 to clone ComfyUI_GGUF custom node."
-            )
-
         # ── DualCLIPLoader ────────────────────────────────────────────────
-        # [190] DualCLIPLoader — Gemma text encoder + embeddings connector
-        print("   Loading CLIP encoders (DualCLIPLoader)…")
+        # [190] DualCLIPLoader - Gemma text encoder + embeddings connector
+        print("\n📦 Loading CLIP encoders (DualCLIPLoader)...")
         try:
             clip_loader = NODE_CLASS_MAPPINGS["DualCLIPLoader"]()
             clip_model  = get_value_at_index(
@@ -1204,7 +1203,7 @@ def generate_pro(
                     device="default"), 0)
         except Exception as e:
             print(f"   ⚠️  fp4 CLIP failed ({type(e).__name__}: {e})")
-            print("      Trying fp8 fallback (gemma_3_12B_it_fp8_scaled.safetensors)…")
+            print("      Trying fp8 fallback (gemma_3_12B_it_fp8_scaled.safetensors)...")
             fp8 = "gemma_3_12B_it_fp8_scaled.safetensors"
             try:
                 clip_model = get_value_at_index(
@@ -1219,77 +1218,23 @@ def generate_pro(
                     "  fp4 needs Blackwell GPU; use fp8 for T4/A100."
                 )
 
-        # ── LoRA stack: LTX2MasterLoaderLD [263] ─────────────────────────
-        # [263] LTX2MasterLoaderLD in LD-I2V.json — 10-slot LoRA stacker
-        print("   Applying LoRA stack (LTX2MasterLoaderLD)…")
-        unet, clip_model = apply_lora_stack(unet, clip_model, _lora_stack, _lora_json)
-
-        # ── Optional performance patches ──────────────────────────────────
-        # [PathchSageAttentionKJ] — KJNodes flash-attention-style patch
-        unet = apply_sage_attention(unet)
-        # [LTXVChunkFeedForward] — ComfyUI-LTXVideo chunk feedforward
-        unet = apply_chunk_ff(unet)
-
-        # Purge VRAM after model loading if enabled
-        # [LayerUtility: PurgeVRAM V2] from LayerStyle nodes
-        purge_vram("after unet+lora")
-        _print_vram()
-
-        # ── VAELoader [184] — video VAE ───────────────────────────────────
-        # [184] VAELoader in LD-I2V.json
-        print("   Loading VAEs…")
-        vaeloader  = NODE_CLASS_MAPPINGS["VAELoader"]()
-        vae_video  = get_value_at_index(
-            vaeloader.load_vae(vae_name=VAE_VIDEO_MODEL), 0)
-
-        # [196] VAELoaderKJ (or VAELoader fallback) — audio VAE
+        # ── Text Encoding (while CLIP is still in VRAM) ───────────────────
+        print("\n📝 Encoding prompts...")
         try:
-            vae_audio = get_value_at_index(_load_audio_vae(VAE_AUDIO_MODEL), 0)
-        except Exception as e:
-            raise RuntimeError(
-                f"Audio VAE load failed: {e}\n"
-                "  Fix: Check VAE_AUDIO_MODEL filename in Cell 6."
-            )
-
-        # ── Spatial upscaler [189] ────────────────────────────────────────
-        # [189] LatentUpscaleModelLoader in LD-I2V.json
-        try:
-            uml = NODE_CLASS_MAPPINGS["LatentUpscaleModelLoader"]()
-            # Try EXECUTE_NORMALIZED first; fall back to load_model if absent
-            if hasattr(uml, "EXECUTE_NORMALIZED"):
-                upscale_model = get_value_at_index(
-                    uml.EXECUTE_NORMALIZED(model_name=UPSCALER_MODEL), 0)
-            elif hasattr(uml, "load_model"):
-                upscale_model = get_value_at_index(
-                    uml.load_model(model_name=UPSCALER_MODEL), 0)
-            else:
-                raise AttributeError("LatentUpscaleModelLoader: no load method found")
-        except Exception as e:
-            raise RuntimeError(
-                f"LatentUpscaleModelLoader failed: {e}\n"
-                "  Fix: Download UPSCALER_MODEL in Cell 2."
-            )
-
-        # ══════════════════════════════════════════════════════════════════
-        # PHASE 2 — TEXT ENCODING
-        # ══════════════════════════════════════════════════════════════════
-
-        print("\n📝 Encoding prompts…")
-        try:
-            # [121] CLIPTextEncode — positive
+            # [121] CLIPTextEncode - positive
             cte      = NODE_CLASS_MAPPINGS["CLIPTextEncode"]()
             cond_pos = cte.encode(text=final_positive, clip=clip_model)
 
-            # [110] CLIPTextEncode — negative (empty for LTX, wrapped in ConditioningZeroOut)
+            # [110] CLIPTextEncode - negative (empty for LTX, wrapped in ConditioningZeroOut)
             cond_neg = cte.encode(text=final_negative, clip=clip_model)
 
-            # ConditioningZeroOut — applied to positive to create zero-out negative branch
+            # ConditioningZeroOut - applied to positive to create zero-out negative branch
             # (mirrors reference notebook pattern for distilled model)
             zero_out  = NODE_CLASS_MAPPINGS["ConditioningZeroOut"]()
             cond_zero = zero_out.zero_out(
                 conditioning=get_value_at_index(cond_pos, 0))
 
-            # [107] LTXVConditioning — injects frame_rate into conditioning metadata
+            # [107] LTXVConditioning - injects frame_rate into conditioning metadata
             ltxv_cond = NODE_CLASS_MAPPINGS["LTXVConditioning"]()
             cond = ltxv_cond.EXECUTE_NORMALIZED(
                 frame_rate=float(fps),
@@ -1301,11 +1246,46 @@ def generate_pro(
         except Exception as e:
             raise RuntimeError(
                 f"Text encoding failed: {e}\n"
-                "  Fix: Check DualCLIPLoader output — CLIP may have failed to load."
+                "  Fix: Check DualCLIPLoader output - CLIP may have failed to load."
             )
 
+        # Delete CLIP now - frees ~6-8 GB for UNet
         del clip_model
-        cleanup_memory()
+        aggressive_cleanup("CLIP deleted")
+
+        # ══════════════════════════════════════════════════════════════════
+        # PHASE 1B - UNET LOADING (after CLIP is freed from VRAM)
+        # ══════════════════════════════════════════════════════════════════
+
+        # ── UNet: UnetLoaderGGUF ──────────────────────────────────────────
+        # [197] UnetLoaderGGUF in LD-I2V.json - loads GGUF Q4_K_M distilled
+        print("\n📦 Loading UNet (GGUF Q4_K_M distilled)...")
+        try:
+            unet_loader = NODE_CLASS_MAPPINGS["UnetLoaderGGUF"]()
+            unet        = get_value_at_index(
+                unet_loader.load_unet(unet_name=_unet), 0)
+        except KeyError:
+            raise RuntimeError(
+                "UnetLoaderGGUF not found.\n"
+                "  Fix: Run Cell 1 to clone ComfyUI_GGUF custom node."
+            )
+
+        # ── LoRA stack: LTX2MasterLoaderLD [263] ─────────────────────────
+        # [263] LTX2MasterLoaderLD in LD-I2V.json - 10-slot LoRA stacker
+        # Pass None for clip_model - IC/camera LoRAs are model-only
+        print("   Applying LoRA stack (LTX2MasterLoaderLD)...")
+        unet, _ = apply_lora_stack(unet, None, _lora_stack, _lora_json)
+
+        # ── Optional performance patches ──────────────────────────────────
+        # [PathchSageAttentionKJ] - KJNodes flash-attention-style patch
+        unet = apply_sage_attention(unet)
+        # [LTXVChunkFeedForward] - ComfyUI-LTXVideo chunk feedforward
+        unet = apply_chunk_ff(unet)
+
+        # Purge VRAM after model loading if enabled
+        # [LayerUtility: PurgeVRAM V2] from LayerStyle nodes
+        purge_vram("after unet+lora")
+        _print_vram()
 
         # ══════════════════════════════════════════════════════════════════
         # PHASE 3 — CHARACTER ANCHOR (mode "anchor" or "both")
@@ -1346,14 +1326,14 @@ def generate_pro(
         print(f"   Latent dims : {half_w}×{half_h}  (half of {width}×{height})")
 
         # ── Character Anchor encoding (Phase 3, deferred here for half-res dims) ──
-        # [295] VAEEncode from SVI-Pro-Workflow.json — encodes character image.
-        # We resize to half_w × half_h so the anchor latent matches EmptyLTXVLatentVideo.
+        # [295] VAEEncode from SVI-Pro-Workflow.json - encodes character image.
+        # We resize to half_w x half_h so the anchor latent matches EmptyLTXVLatentVideo.
         anchor_latent = None
         if char_image_tensor is not None and _char_mode in ("anchor", "both"):
-            print("\n🧬 Character Anchor — encoding character image as latent…")
+            print("\n🧬 Character Anchor - encoding character image as latent...")
             try:
-                # [165] ImageResizeKJv2 — resize to HALF resolution (matches vid_lat)
-                # half_w × half_h ensures spatial dims match EmptyLTXVLatentVideo
+                # [165] ImageResizeKJv2 - resize to HALF resolution (matches vid_lat)
+                # half_w x half_h ensures spatial dims match EmptyLTXVLatentVideo
                 ikj = NODE_CLASS_MAPPINGS["ImageResizeKJv2"]()
                 char_resized = get_value_at_index(
                     ikj.resize(
@@ -1368,14 +1348,20 @@ def generate_pro(
                         device="cpu",
                     ), 0)
 
-                # [295] VAEEncode — pixels at half_w × half_h → latent at ~(half_w/8 × half_h/8)
+                # Load VAE fresh for anchor encoding
+                vae_for_anchor = get_value_at_index(
+                    NODE_CLASS_MAPPINGS["VAELoader"]().load_vae(vae_name=VAE_VIDEO_MODEL), 0)
+
+                # [295] VAEEncode - pixels at half_w x half_h -> latent at ~(half_w/8 x half_h/8)
                 # This matches the spatial dims of EmptyLTXVLatentVideo(half_w, half_h)
                 vae_enc       = NODE_CLASS_MAPPINGS["VAEEncode"]()
                 anchor_latent = get_value_at_index(
-                    vae_enc.encode(pixels=char_resized, vae=vae_video), 0)
+                    vae_enc.encode(pixels=char_resized, vae=vae_for_anchor), 0)
+                del vae_for_anchor
+                aggressive_cleanup("VAE anchor done")
                 print(f"   ✓ Character anchor encoded at {half_w}×{half_h}  (mode={_char_mode})")
             except Exception as e:
-                print(f"   ⚠️  Character anchor failed ({e}) — continuing without anchor.")
+                print(f"   ⚠️  Character anchor failed ({e}) - continuing without anchor.")
                 anchor_latent = None
 
         # [108] EmptyLTXVLatentVideo — half-res video latent
@@ -1387,13 +1373,13 @@ def generate_pro(
         if _use_i2v and _ref_tensor is not None:
             try:
                 # Resize reference image to full target resolution first
-                # [246] ResizeImagesByLongerEdge — longer_edge=1536
+                # [246] ResizeImagesByLongerEdge - longer_edge=1536
                 if "ResizeImagesByLongerEdge" in NODE_CLASS_MAPPINGS:
                     rle     = NODE_CLASS_MAPPINGS["ResizeImagesByLongerEdge"]()
                     _ref_tensor = get_value_at_index(
                         rle.resize(images=_ref_tensor, longer_edge=1536), 0)
 
-                # [165] ImageResizeKJv2 — precise resize to half_w*2 × half_h*2
+                # [165] ImageResizeKJv2 - precise resize to half_w*2 x half_h*2
                 if "ImageResizeKJv2" in NODE_CLASS_MAPPINGS:
                     ikj2 = NODE_CLASS_MAPPINGS["ImageResizeKJv2"]()
                     _ref_tensor = get_value_at_index(
@@ -1409,7 +1395,7 @@ def generate_pro(
                             device="cpu",
                         ), 0)
                 else:
-                    # Fallback: ResizeImageMaskNode — use scale by multiplier to
+                    # Fallback: ResizeImageMaskNode - use scale by multiplier to
                     # approximate the target size. Note: "scale dimensions" mode is
                     # not a valid resize_type for this node; only "scale by multiplier"
                     # and "scale to fit" are documented in LD-I2V.json widgets_values.
@@ -1425,7 +1411,7 @@ def generate_pro(
                             resize_type={"resize_type": "scale by multiplier",
                                          "multiplier": _scale}), 0)
 
-                # [162] LTXVPreprocess — compress/normalise image before I2V injection
+                # [162] LTXVPreprocess - compress/normalise image before I2V injection
                 # img_compression=33 matches LD-I2V.json node [162] widgets_values
                 pp_node = NODE_CLASS_MAPPINGS["LTXVPreprocess"]()
                 pp_img  = get_value_at_index(
@@ -1433,7 +1419,11 @@ def generate_pro(
                         img_compression=33,
                         image=_ref_tensor), 0)
 
-                # [161] LTXVImgToVideoInplace — inject image into video latent
+                # Load VAE fresh for I2V conditioning
+                vae_for_i2v = get_value_at_index(
+                    NODE_CLASS_MAPPINGS["VAELoader"]().load_vae(vae_name=VAE_VIDEO_MODEL), 0)
+
+                # [161] LTXVImgToVideoInplace - inject image into video latent
                 # strength = character_strength (if char mode) else image_strength
                 _i2v_strength = character_strength if _char_mode in ("i2v", "both") \
                                 else image_strength
@@ -1441,19 +1431,21 @@ def generate_pro(
                 vid_lat = i2v.EXECUTE_NORMALIZED(
                     strength=_i2v_strength,
                     bypass=False,
-                    vae=vae_video,
+                    vae=vae_for_i2v,
                     image=pp_img,
                     latent=get_value_at_index(vid_lat, 0))
+                del vae_for_i2v
+                aggressive_cleanup("VAE I2V done")
                 print(f"   ✓ I2V conditioning applied  (strength={_i2v_strength}, "
                       f"LTXVImgToVideoInplace)")
             except KeyError as e:
-                print(f"   ⚠️  I2V node missing ({e}) — using empty latent (T2V mode).")
+                print(f"   ⚠️  I2V node missing ({e}) - using empty latent (T2V mode).")
                 vid_lat = (get_value_at_index(vid_lat, 0),)
             except Exception as e:
-                print(f"   ⚠️  I2V conditioning failed ({e}) — using empty latent.")
+                print(f"   ⚠️  I2V conditioning failed ({e}) - using empty latent.")
                 vid_lat = (get_value_at_index(vid_lat, 0),)
         else:
-            # T2V — use empty latent directly
+            # T2V - use empty latent directly
             vid_lat = (get_value_at_index(vid_lat, 0),)
 
         # Inject anchor_latent as a constraint if in anchor mode
@@ -1488,7 +1480,17 @@ def generate_pro(
                 print(f"   ⚠️  Anchor injection error ({e}) — using empty/I2V latent.")
                 _vid_lat_input = get_value_at_index(vid_lat, 0)
 
-        # [199] LTXVEmptyLatentAudio — audio latent
+        # [199] LTXVEmptyLatentAudio - audio latent
+        # Load audio VAE right before it's needed (~1GB, kept through audio decode)
+        # [196] VAELoaderKJ (or VAELoader fallback) - audio VAE
+        try:
+            vae_audio = get_value_at_index(_load_audio_vae(VAE_AUDIO_MODEL), 0)
+        except Exception as e:
+            raise RuntimeError(
+                f"Audio VAE load failed: {e}\n"
+                "  Fix: Check VAE_AUDIO_MODEL filename in Cell 6."
+            )
+
         elalat  = NODE_CLASS_MAPPINGS["LTXVEmptyLatentAudio"]()
         aud_lat = elalat.EXECUTE_NORMALIZED(
             frames_number=frames, frame_rate=fps, batch_size=1,
@@ -1600,7 +1602,7 @@ def generate_pro(
             )
 
         del guider_p1
-        cleanup_memory()
+        aggressive_cleanup("Pass 1 done")
         print("   ✓ Pass 1 complete")
 
         # ══════════════════════════════════════════════════════════════════
@@ -1631,14 +1633,36 @@ def generate_pro(
             positive=get_value_at_index(cropped, 0),
             negative=get_value_at_index(cropped, 1))
 
-        # [LTXVLatentUpsampler] [118] — 2× spatial upsample
+        # [LTXVLatentUpsampler] [118] - 2x spatial upsample
+        # Load VAE and upscale model fresh for upsampling
+        vae_for_up = get_value_at_index(
+            NODE_CLASS_MAPPINGS["VAELoader"]().load_vae(vae_name=VAE_VIDEO_MODEL), 0)
+
+        # [189] LatentUpscaleModelLoader in LD-I2V.json
+        try:
+            uml = NODE_CLASS_MAPPINGS["LatentUpscaleModelLoader"]()
+            # Try EXECUTE_NORMALIZED first; fall back to load_model if absent
+            if hasattr(uml, "EXECUTE_NORMALIZED"):
+                upscale_model = get_value_at_index(
+                    uml.EXECUTE_NORMALIZED(model_name=UPSCALER_MODEL), 0)
+            elif hasattr(uml, "load_model"):
+                upscale_model = get_value_at_index(
+                    uml.load_model(model_name=UPSCALER_MODEL), 0)
+            else:
+                raise AttributeError("LatentUpscaleModelLoader: no load method found")
+        except Exception as e:
+            raise RuntimeError(
+                f"LatentUpscaleModelLoader failed: {e}\n"
+                "  Fix: Download UPSCALER_MODEL in Cell 2."
+            )
+
         ltxvup    = NODE_CLASS_MAPPINGS["LTXVLatentUpsampler"]()
         upsampled = ltxvup.upsample_latent(
             samples=get_value_at_index(cropped, 2),
             upscale_model=upscale_model,
-            vae=vae_video)
-        del upscale_model
-        cleanup_memory()
+            vae=vae_for_up)
+        del vae_for_up, upscale_model
+        aggressive_cleanup("VAE upscale done")
 
         # [LTXVConcatAVLatent] [117] — upsampled video + audio
         av_lat2 = catav.EXECUTE_NORMALIZED(
@@ -1662,7 +1686,7 @@ def generate_pro(
             )
 
         del guider_p2, unet
-        cleanup_memory()
+        aggressive_cleanup("Pass 2 done - UNet freed")
         print("   ✓ Pass 2 complete")
 
         # ══════════════════════════════════════════════════════════════════
@@ -1678,15 +1702,19 @@ def generate_pro(
         aud_lat_fin = get_value_at_index(s2, 1)
 
         # ── Video decode ───────────────────────────────────────────────────
+        # Load VAE fresh for decode
+        vae_for_decode = get_value_at_index(
+            NODE_CLASS_MAPPINGS["VAELoader"]().load_vae(vae_name=VAE_VIDEO_MODEL), 0)
+
         decoded_frames = None
         if use_tiled_vae:
-            # [265] LTXVSpatioTemporalTiledVAEDecode — ComfyUI-LTXVideo
+            # [265] LTXVSpatioTemporalTiledVAEDecode - ComfyUI-LTXVideo
             # VRAM-efficient tiled spatiotemporal decode
             try:
                 tiled_dec = NODE_CLASS_MAPPINGS["LTXVSpatioTemporalTiledVAEDecode"]()
                 decoded_frames = get_value_at_index(
                     tiled_dec.EXECUTE_NORMALIZED(
-                        vae=vae_video,
+                        vae=vae_for_decode,
                         latents=vid_lat_fin,
                         spatial_tiles=tiled_spatial_tiles,
                         spatial_overlap=tiled_spatial_overlap,
@@ -1703,28 +1731,28 @@ def generate_pro(
                 use_tiled_vae = False
 
         if not use_tiled_vae or decoded_frames is None:
-            # Standard VAEDecode — always available in ComfyUI core
+            # Standard VAEDecode - always available in ComfyUI core
             vaedecode = NODE_CLASS_MAPPINGS["VAEDecode"]()
             decoded_frames = get_value_at_index(
-                vaedecode.decode(samples=vid_lat_fin, vae=vae_video), 0)
+                vaedecode.decode(samples=vid_lat_fin, vae=vae_for_decode), 0)
             print("   ✓ Standard VAE decode (VAEDecode)")
 
-        del vae_video
-        cleanup_memory()
+        del vae_for_decode
+        aggressive_cleanup("VAE decode done")
 
         # ── Audio decode [201] ─────────────────────────────────────────────
-        # [201] LTXVAudioVAEDecode — decode audio latent
+        # [201] LTXVAudioVAEDecode - decode audio latent
         try:
             aud_dec   = NODE_CLASS_MAPPINGS["LTXVAudioVAEDecode"]()
             audio_out = aud_dec.EXECUTE_NORMALIZED(
                 samples=aud_lat_fin,
                 audio_vae=vae_audio)
         except Exception as e:
-            print(f"   ⚠️  Audio decode failed ({e}) — proceeding without audio.")
+            print(f"   ⚠️  Audio decode failed ({e}) - proceeding without audio.")
             audio_out = None
 
         del vae_audio
-        cleanup_memory()
+        aggressive_cleanup("audio VAE done")
 
         # ══════════════════════════════════════════════════════════════════
         # PHASE 9 — SAVE  (VHS_VideoCombine preferred, CreateVideo fallback)
