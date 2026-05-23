@@ -547,7 +547,7 @@ def apply_lora_stack(unet, clip_model,
         return unet, clip_model
 
     # ── Try LTX2MasterLoaderLD node [263] (LoRa Daddy) ───────────────────────
-    if "LTX2MasterLoaderLD" in NODE_CLASS_MAPPINGS:
+    if "LTX2MasterLoaderLD" in NODE_CLASS_MAPPINGS and clip_model is not None:
         print(f"   [MasterLoader] {len(active)} LoRA(s) via LTX2MasterLoaderLD…")
         try:
             node   = NODE_CLASS_MAPPINGS["LTX2MasterLoaderLD"]()
@@ -1483,6 +1483,7 @@ def generate_pro(
         # [199] LTXVEmptyLatentAudio - audio latent
         # Load audio VAE right before it's needed (~1GB, kept through audio decode)
         # [196] VAELoaderKJ (or VAELoader fallback) - audio VAE
+        vae_audio = None
         try:
             vae_audio = get_value_at_index(_load_audio_vae(VAE_AUDIO_MODEL), 0)
         except Exception as e:
@@ -1595,6 +1596,9 @@ def generate_pro(
                 latent_image=combined_latent)
             p1_av = get_value_at_index(out1, 0)  # raw AV output → Pass 2
         except Exception as e:
+            if vae_audio is not None:
+                del vae_audio
+                vae_audio = None
             raise RuntimeError(
                 f"Pass 1 sampling failed: {e}\n"
                 "  Fix: If you see 'deformed output', try a different SEED.\n"
@@ -1651,6 +1655,9 @@ def generate_pro(
             else:
                 raise AttributeError("LatentUpscaleModelLoader: no load method found")
         except Exception as e:
+            if vae_audio is not None:
+                del vae_audio
+                vae_audio = None
             raise RuntimeError(
                 f"LatentUpscaleModelLoader failed: {e}\n"
                 "  Fix: Download UPSCALER_MODEL in Cell 2."
@@ -1680,6 +1687,9 @@ def generate_pro(
                 latent_image=get_value_at_index(av_lat2, 0))
             p2_denoised = get_value_at_index(out2, 1)  # denoised_output slot
         except Exception as e:
+            if vae_audio is not None:
+                del vae_audio
+                vae_audio = None
             raise RuntimeError(
                 f"Pass 2 sampling failed: {e}\n"
                 "  Fix: Try reducing TILED_SPATIAL_TILES or USE_TILED_VAE=False."
@@ -2036,23 +2046,28 @@ def run_storyboard(
 
         # Determine frames (auto-reduce if needed)
         _frames = scene.get("frames", FRAMES)
+        _original_frames = _frames
         if auto_reduce_for_stability and len(scenes) > 3:
             _frames = min(97, _frames)
+        if _frames < _original_frames:
+            print(f"   \u2699\ufe0f  Frames capped: {_original_frames} \u2192 {_frames} (auto-stability)")
 
         # ── Retry loop ────────────────────────────────────────────────────
         max_retries = 3
         success = False
         scene_seed = scene.get("seed", SEED)
+        _retry_frames = _frames
+        _retry_tiled_vae = None  # None means use default; True forces tiled
         for attempt in range(max_retries):
             try:
-                out = generate_pro(
+                _gen_kwargs = dict(
                     user_input           = scene.get("user_input", USER_INPUT),
                     image_path           = _image_path,
                     positive_prompt      = scene.get("positive_prompt", POSITIVE_PROMPT),
                     negative_prompt      = scene.get("negative_prompt", NEGATIVE_PROMPT),
                     width                = scene.get("width", WIDTH),
                     height               = scene.get("height", HEIGHT),
-                    frames               = _frames,
+                    frames               = _retry_frames,
                     fps                  = scene.get("fps", FPS),
                     seed                 = scene_seed,
                     image_strength       = scene.get("image_strength", IMAGE_STRENGTH),
@@ -2063,6 +2078,9 @@ def run_storyboard(
                     character_description= scene.get("character_description", CHARACTER_DESCRIPTION),
                     output_prefix        = scene.get("output_prefix", OUTPUT_PREFIX),
                 )
+                if _retry_tiled_vae is not None:
+                    _gen_kwargs["use_tiled_vae"] = _retry_tiled_vae
+                out = generate_pro(**_gen_kwargs)
                 # Cache successful clip
                 if out:
                     shutil.copy(out, f"{cache_dir}/scene_{i:02d}.mp4")
@@ -2074,6 +2092,13 @@ def run_storyboard(
             except torch.cuda.OutOfMemoryError:
                 aggressive_cleanup("OOM recovery")
                 scene_seed = scene.get("seed", SEED) + attempt + 1
+                # Progressive memory pressure reduction for next attempt
+                if attempt >= 0:
+                    _retry_frames = max(57, _retry_frames - 24)
+                    print(f"   \u26a0\ufe0f  Reducing frames to {_retry_frames} for next attempt.")
+                if attempt >= 1:
+                    _retry_tiled_vae = True
+                    print(f"   \u26a0\ufe0f  Forcing tiled VAE for next attempt.")
                 print(f"   \u26a0\ufe0f  OOM on attempt {attempt+1} \u2014 retrying with seed {scene_seed}...")
                 if attempt == max_retries - 1:
                     print(f"   \u274c Scene {scene_num} failed after {max_retries} attempts")
