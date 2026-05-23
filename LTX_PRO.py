@@ -1934,10 +1934,31 @@ USE_STORYBOARD = False  # @param {type:"boolean"}
 # Set True in Cell 9 to run all scenes instead of a single clip.
 
 
+def concatenate_clips(clip_paths: List[str], output_path: str) -> Optional[str]:
+    """Concatenate video clips using ffmpeg concat demuxer."""
+    valid_paths = [p for p in clip_paths if p and os.path.exists(p)]
+    if len(valid_paths) < 2:
+        return valid_paths[0] if valid_paths else None
+    list_file = "/tmp/concat_list.txt"
+    with open(list_file, "w") as f:
+        for p in valid_paths:
+            f.write(f"file '{p}'\n")
+    try:
+        subprocess.run(["ffmpeg", "-y", "-f", "concat", "-safe", "0",
+                        "-i", list_file, "-c", "copy", output_path],
+                       check=True, capture_output=True)
+        print(f"   \u2713 Concatenated {len(valid_paths)} clips \u2192 {output_path}")
+        return output_path
+    except Exception as e:
+        print(f"   \u26a0\ufe0f  Concatenation failed ({e}) \u2014 individual clips still available.")
+        return None
+
+
 def run_storyboard(
     scenes:          List[Dict],
     use_continuity:  bool = USE_SCENE_CONTINUITY,
     tmp_dir:         str  = "/content/ComfyUI/input",
+    auto_reduce_for_stability: bool = True,
 ) -> List[Optional[str]]:
     """
     Run a list of scenes sequentially, optionally chaining last-frame continuity.
@@ -1960,20 +1981,48 @@ def run_storyboard(
     outputs = []
     prev_output = None
 
-    print("🎬 Storyboard Runner — Starting")
+    # ── Cache directory setup ─────────────────────────────────────────────
+    cache_dir = f"/content/ComfyUI/output/{scenes[0].get('output_prefix', OUTPUT_PREFIX)}_cache"
+    os.makedirs(cache_dir, exist_ok=True)
+
+    print("\U0001f3ac Storyboard Runner \u2014 Starting")
     print(f"   Scenes    : {len(scenes)}")
     print(f"   Continuity: {use_continuity}")
-    print("─" * 70)
+    print("\u2500" * 70)
+
+    # ── Resume logic: check for cached clips ──────────────────────────────
+    start_index = 0
+    for i in range(len(scenes)):
+        cached_clip = f"{cache_dir}/scene_{i:02d}.mp4"
+        if os.path.exists(cached_clip):
+            outputs.append(cached_clip)
+            start_index = i + 1
+            prev_output = cached_clip
+        else:
+            break
+
+    if start_index > 0:
+        print(f"   \u23e9 Resuming from scene {start_index + 1} (found {start_index} cached clips)")
+
+    # ── Auto-reduce frames for stability ──────────────────────────────────
+    if auto_reduce_for_stability and len(scenes) > 3:
+        print(f"   \u2699\ufe0f  Auto-stability: capping frames to 97 for multi-scene mode ({len(scenes)} scenes)")
+
+    storyboard_start = time.time()
+    completed_count = 0
 
     for i, scene in enumerate(scenes):
+        if i < start_index:
+            continue
+
         scene_num = i + 1
-        print(f"\n🎬 Scene {scene_num}/{len(scenes)}: {scene.get('output_prefix','Scene')}")
-        print(f"   Input: {scene.get('user_input','')[:80]}…")
+        print(f"\n\U0001f3ac Scene {scene_num}/{len(scenes)}: {scene.get('output_prefix','Scene')}")
+        print(f"   Input: {scene.get('user_input','')[:80]}\u2026")
 
         # Resolve image_path: use continuity frame if available and not explicitly set
         _image_path = scene.get("image_path")
         if use_continuity and prev_output and _image_path is None:
-            print(f"   🔗 Continuity: extracting last frame from scene {scene_num - 1}…")
+            print(f"   \U0001f517 Continuity: extracting last frame from scene {scene_num - 1}\u2026")
             last_tensor = get_last_frame_tensor(prev_output)
             if last_tensor is not None:
                 _cont_path = os.path.join(tmp_dir, f"_continuity_s{scene_num:02d}.jpg")
@@ -1981,50 +2030,88 @@ def run_storyboard(
                 pil_frame = tensor_to_pil(last_tensor)
                 pil_frame.save(_cont_path, "JPEG", quality=95)
                 _image_path = _cont_path
-                print(f"   ✓ Continuity frame saved: {_cont_path}")
+                print(f"   \u2713 Continuity frame saved: {_cont_path}")
             else:
-                print(f"   ⚠️  Could not extract last frame — skipping continuity.")
+                print(f"   \u26a0\ufe0f  Could not extract last frame \u2014 skipping continuity.")
 
-        try:
-            out = generate_pro(
-                user_input           = scene.get("user_input", USER_INPUT),
-                image_path           = _image_path,
-                positive_prompt      = scene.get("positive_prompt", POSITIVE_PROMPT),
-                negative_prompt      = scene.get("negative_prompt", NEGATIVE_PROMPT),
-                width                = scene.get("width", WIDTH),
-                height               = scene.get("height", HEIGHT),
-                frames               = scene.get("frames", FRAMES),
-                fps                  = scene.get("fps", FPS),
-                seed                 = scene.get("seed", SEED),
-                image_strength       = scene.get("image_strength", IMAGE_STRENGTH),
-                character_image_path = scene.get("character_image_path", CHARACTER_IMAGE_PATH),
-                character_strength   = scene.get("character_strength", CHARACTER_STRENGTH),
-                character_mode       = scene.get("character_mode", CHARACTER_CONSISTENCY_MODE),
-                character_name       = scene.get("character_name", CHARACTER_NAME),
-                character_description= scene.get("character_description", CHARACTER_DESCRIPTION),
-                output_prefix        = scene.get("output_prefix", OUTPUT_PREFIX),
-            )
-            outputs.append(out)
-            prev_output = out
-            print(f"   ✅ Scene {scene_num} done → {out}")
-        except Exception as e:
-            import traceback
-            print(f"   ❌ Scene {scene_num} failed: {type(e).__name__}: {e}")
-            traceback.print_exc()
+        # Determine frames (auto-reduce if needed)
+        _frames = scene.get("frames", FRAMES)
+        if auto_reduce_for_stability and len(scenes) > 3:
+            _frames = min(97, _frames)
+
+        # ── Retry loop ────────────────────────────────────────────────────
+        max_retries = 3
+        success = False
+        scene_seed = scene.get("seed", SEED)
+        for attempt in range(max_retries):
+            try:
+                out = generate_pro(
+                    user_input           = scene.get("user_input", USER_INPUT),
+                    image_path           = _image_path,
+                    positive_prompt      = scene.get("positive_prompt", POSITIVE_PROMPT),
+                    negative_prompt      = scene.get("negative_prompt", NEGATIVE_PROMPT),
+                    width                = scene.get("width", WIDTH),
+                    height               = scene.get("height", HEIGHT),
+                    frames               = _frames,
+                    fps                  = scene.get("fps", FPS),
+                    seed                 = scene_seed,
+                    image_strength       = scene.get("image_strength", IMAGE_STRENGTH),
+                    character_image_path = scene.get("character_image_path", CHARACTER_IMAGE_PATH),
+                    character_strength   = scene.get("character_strength", CHARACTER_STRENGTH),
+                    character_mode       = scene.get("character_mode", CHARACTER_CONSISTENCY_MODE),
+                    character_name       = scene.get("character_name", CHARACTER_NAME),
+                    character_description= scene.get("character_description", CHARACTER_DESCRIPTION),
+                    output_prefix        = scene.get("output_prefix", OUTPUT_PREFIX),
+                )
+                # Cache successful clip
+                if out:
+                    shutil.copy(out, f"{cache_dir}/scene_{i:02d}.mp4")
+                outputs.append(out)
+                prev_output = out
+                success = True
+                print(f"   \u2705 Scene {scene_num} done \u2192 {out}")
+                break
+            except torch.cuda.OutOfMemoryError:
+                aggressive_cleanup("OOM recovery")
+                scene_seed = scene.get("seed", SEED) + attempt + 1
+                print(f"   \u26a0\ufe0f  OOM on attempt {attempt+1} \u2014 retrying with seed {scene_seed}...")
+                if attempt == max_retries - 1:
+                    print(f"   \u274c Scene {scene_num} failed after {max_retries} attempts")
+            except Exception as e:
+                print(f"   \u274c Scene {scene_num} error: {type(e).__name__}: {e}")
+                break
+
+        if not success:
             outputs.append(None)
             prev_output = None  # don't chain from a failed scene
 
+        completed_count += 1
+
+        # ── Progress tracking ─────────────────────────────────────────────
+        elapsed = time.time() - storyboard_start
+        avg_per_clip = elapsed / completed_count if completed_count > 0 else 0
+        remaining = avg_per_clip * (len(scenes) - i - 1)
+        print(f"   \u23f1\ufe0f  Elapsed: {elapsed/60:.1f}min | Est. remaining: {remaining/60:.1f}min")
+
+    # ── Final concatenation ───────────────────────────────────────────────
+    successful_clips = [p for p in outputs if p]
+    if len(successful_clips) >= 2:
+        final_path = f"/content/ComfyUI/output/{scenes[0].get('output_prefix', OUTPUT_PREFIX)}_full.mp4"
+        concat_result = concatenate_clips(successful_clips, final_path)
+        if concat_result:
+            print(f"   \U0001f3ac Final video: {concat_result}")
+
     # ── Summary ───────────────────────────────────────────────────────────
-    print("\n" + "═" * 70)
-    print("🎬 Storyboard Complete")
+    print("\n" + "\u2550" * 70)
+    print("\U0001f3ac Storyboard Complete")
     print(f"   Total scenes : {len(scenes)}")
     print(f"   Successful   : {sum(1 for p in outputs if p)}")
     print(f"   Failed       : {sum(1 for p in outputs if not p)}")
     print("\n   Output paths:")
     for i, p in enumerate(outputs):
-        status = "✅" if p else "❌"
+        status = "\u2705" if p else "\u274c"
         print(f"   {status} Scene {i+1}: {p or 'FAILED'}")
-    print("═" * 70)
+    print("\u2550" * 70)
 
     return outputs
 
