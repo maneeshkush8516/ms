@@ -341,6 +341,139 @@ def get_last_frame_tensor(video_path: str) -> Optional[torch.Tensor]:
     frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     return torch.from_numpy(frame).float().unsqueeze(0) / 255.0
 
+# ── Overlap / Segment Extension helpers (SVI-Pro-Workflow.json techniques) ────
+
+def blend_overlap_frames(source_frames: torch.Tensor, new_frames: torch.Tensor,
+                         overlap: int = 5, mode: str = "linear_blend",
+                         side: str = "source") -> torch.Tensor:
+    """
+    Blend overlapping frames between two video segments for seamless transitions.
+    Mirrors ImageBatchExtendWithOverlap from comfyui-kjnodes (SVI-Pro-Workflow.json).
+    
+    Args:
+        source_frames: Previous segment frames tensor (T, H, W, C) or (N, T, H, W, C)
+        new_frames: New segment frames tensor (same format)
+        overlap: Number of overlapping frames (SVI-Pro default: 5)
+        mode: Blend mode - "linear_blend", "hard_cut", or "crossfade"
+        side: Which segment contributes overlap - "source" or "target"
+    
+    Returns:
+        Combined frames tensor with seamless blend at the junction
+    """
+    # Ensure we're working with 4D tensors (T, H, W, C)
+    if source_frames.ndim == 5:
+        source_frames = source_frames.squeeze(0)
+    if new_frames.ndim == 5:
+        new_frames = new_frames.squeeze(0)
+    
+    if overlap <= 0 or overlap >= min(len(source_frames), len(new_frames)):
+        # No valid overlap - just concatenate
+        return torch.cat([source_frames, new_frames], dim=0)
+    
+    if mode == "hard_cut":
+        # No blending - take source frames up to overlap, then new frames after
+        if side == "source":
+            return torch.cat([source_frames, new_frames[overlap:]], dim=0)
+        else:
+            return torch.cat([source_frames[:-overlap], new_frames], dim=0)
+    
+    elif mode == "linear_blend":
+        # Linear blend in overlap region (SVI-Pro default)
+        # Source provides the "tail" frames, new provides the "head" frames
+        source_tail = source_frames[-overlap:]  # last N frames of source
+        new_head = new_frames[:overlap]          # first N frames of new
+        
+        # Create linear blend weights
+        weights = torch.linspace(1.0, 0.0, overlap, device=source_frames.device)
+        weights = weights.view(-1, 1, 1, 1)  # (overlap, 1, 1, 1) for broadcasting
+        
+        # Blend: source_weight decreases, new_weight increases
+        blended = source_tail * weights + new_head * (1.0 - weights)
+        
+        # Assemble: source (minus tail) + blended region + new (minus head)
+        result = torch.cat([
+            source_frames[:-overlap],
+            blended,
+            new_frames[overlap:]
+        ], dim=0)
+        return result
+    
+    elif mode == "crossfade":
+        # Equal-weight crossfade (smoother than linear for some content)
+        source_tail = source_frames[-overlap:]
+        new_head = new_frames[:overlap]
+        
+        # Sigmoid-like weights for smoother transition
+        t = torch.linspace(0.0, 1.0, overlap, device=source_frames.device)
+        weights = 0.5 * (1.0 - torch.cos(t * 3.14159))  # cosine interpolation
+        weights = weights.view(-1, 1, 1, 1)
+        
+        blended = source_tail * (1.0 - weights) + new_head * weights
+        
+        result = torch.cat([
+            source_frames[:-overlap],
+            blended,
+            new_frames[overlap:]
+        ], dim=0)
+        return result
+    
+    else:
+        # Unknown mode - fallback to linear_blend
+        return blend_overlap_frames(source_frames, new_frames, overlap, "linear_blend", side)
+
+
+def extract_anchor_frame(frames: torch.Tensor, position: str = "last") -> torch.Tensor:
+    """
+    Extract a single frame from a video tensor for use as anchor/seed.
+    Used by segment extension to chain segments with character consistency.
+    
+    Args:
+        frames: Video frames tensor (T, H, W, C) or (N, T, H, W, C)
+        position: "last", "first", or integer frame index
+    
+    Returns:
+        Single frame tensor (1, H, W, C) suitable for I2V/anchor conditioning
+    """
+    if frames.ndim == 5:
+        frames = frames.squeeze(0)
+    
+    if position == "last":
+        return frames[-1:].clone()
+    elif position == "first":
+        return frames[:1].clone()
+    elif isinstance(position, int):
+        idx = min(position, len(frames) - 1)
+        return frames[idx:idx+1].clone()
+    else:
+        return frames[-1:].clone()
+
+
+def compute_segment_seeds(base_seed: int, num_segments: int, 
+                          mode: str = "fixed") -> list:
+    """
+    Compute seeds for each segment based on mode.
+    SVI-Pro uses fixed seed=2025 for all segments.
+    
+    Args:
+        base_seed: Starting seed value
+        num_segments: Number of segments
+        mode: "fixed", "increment", or "random"
+    
+    Returns:
+        List of seed values, one per segment
+    """
+    if mode == "fixed":
+        return [base_seed] * num_segments
+    elif mode == "increment":
+        return [base_seed + i for i in range(num_segments)]
+    elif mode == "random":
+        import random as _rng
+        _rng.seed(base_seed)
+        return [_rng.randint(0, 2**32 - 1) for _ in range(num_segments)]
+    else:
+        return [base_seed] * num_segments
+
+
 # ── Video display & saving ────────────────────────────────────────────────────
 def display_video(path: str) -> None:
     if not path or not os.path.exists(path):
@@ -846,6 +979,37 @@ print(f"   Camera LoRA    : {CAMERA_LORA} @ {CAMERA_LORA_STRENGTH}")
 print(f"   Active LoRA slots: {_active_count}/10")
 print(f"   Pro Mode       : {PRO_MODE}  |  SageAttn: {USE_SAGE_ATTENTION}  |  ChunkFF: {USE_CHUNK_FF}")
 
+# ── Overlap Frames (from SVI-Pro-Workflow.json — ImageBatchExtendWithOverlap) ──
+OVERLAP_FRAMES = 5           # @param {type:"integer"}
+# Number of frames to overlap between consecutive segments/scenes.
+# SVI-Pro default: 5 frames with linear_blend for smooth transitions.
+
+OVERLAP_MODE = "linear_blend"  # @param ["linear_blend", "hard_cut", "crossfade"]
+# "linear_blend" — SVI-Pro default, linearly blends overlap region
+# "hard_cut"     — no blending, just use source frames
+# "crossfade"    — equal-weight crossfade in overlap region
+
+OVERLAP_SIDE = "source"      # @param ["source", "target"]
+# Which side contributes the overlap frames (SVI-Pro default: "source")
+
+USE_SEGMENT_EXTENSION = False  # @param {type:"boolean"}
+# When True, generates video in 81-frame segments (SVI-Pro style) and
+# stitches them using OVERLAP_FRAMES for extended-length video.
+
+SEGMENT_LENGTH = 81           # @param {type:"integer"}
+# Frames per segment when USE_SEGMENT_EXTENSION=True (SVI-Pro default: 81)
+
+MAX_SEGMENTS = 8              # @param {type:"integer"}
+# Maximum segments to generate (SVI-Pro default: 8, ~40s at 16fps)
+
+SEGMENT_SEED_MODE = "fixed"   # @param ["fixed", "increment", "random"]
+# "fixed"     — use same seed for all segments (SVI-Pro uses 2025)
+# "increment" — increment seed per segment
+# "random"    — random seed per segment
+
+print(f"   Overlap      : {OVERLAP_FRAMES} frames ({OVERLAP_MODE}, side={OVERLAP_SIDE})")
+print(f"   Seg Extension: {USE_SEGMENT_EXTENSION}  |  {SEGMENT_LENGTH} frames x {MAX_SEGMENTS} segments")
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CELL 6  ─  VIDEO GENERATION CONFIGURATION
@@ -942,6 +1106,8 @@ print(f"   Seed       : {SEED}  (auto-increment: {AUTO_INCREMENT_SEED})")
 print(f"   Pass 1     : {PASS1_SAMPLER}  |  {PASS1_SIGMAS[:45]}…")
 print(f"   Pass 2     : {PASS2_SAMPLER}  |  {PASS2_SIGMAS}")
 print(f"   Pro Mode   : {PRO_MODE}  |  steps={PRO_STEPS}, scheduler={PRO_SCHEDULER}, split@{PRO_SPLIT_AT}")
+print(f"   Overlap    : {OVERLAP_FRAMES} frames ({OVERLAP_MODE}, side={OVERLAP_SIDE})")
+print(f"   Seg Extend : {USE_SEGMENT_EXTENSION}  |  {SEGMENT_LENGTH} frames x {MAX_SEGMENTS} segments")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1872,8 +2038,194 @@ def generate_pro(
     return output_path
 
 
-print("✅ generate_pro() defined — run Cell 9 to generate.")
-print("   Signature: generate_pro(user_input, image_path, width, height, frames, …)")
+print("✅ generate_pro() and generate_extended_video() defined — run Cell 9 to generate.")
+print("   generate_pro(): Single clip generation with character consistency")
+print("   generate_extended_video(): SVI-Pro style multi-segment with overlap blending")
+
+
+def generate_extended_video(
+    user_input:              str   = USER_INPUT,
+    image_path:              str   = IMAGE_PATH,
+    positive_prompt:         str   = POSITIVE_PROMPT,
+    negative_prompt:         str   = NEGATIVE_PROMPT,
+    width:                   int   = WIDTH,
+    height:                  int   = HEIGHT,
+    fps:                     int   = FPS,
+    seed:                    int   = SEED,
+    image_strength:          float = IMAGE_STRENGTH,
+    character_image_path:    str   = CHARACTER_IMAGE_PATH,
+    character_strength:      float = CHARACTER_STRENGTH,
+    character_mode:          str   = CHARACTER_CONSISTENCY_MODE,
+    character_name:          str   = CHARACTER_NAME,
+    character_description:   str   = CHARACTER_DESCRIPTION,
+    # SVI-Pro segment extension settings
+    segment_length:          int   = SEGMENT_LENGTH,
+    max_segments:            int   = MAX_SEGMENTS,
+    overlap_frames:          int   = OVERLAP_FRAMES,
+    overlap_mode:            str   = OVERLAP_MODE,
+    overlap_side:            str   = OVERLAP_SIDE,
+    segment_seed_mode:       str   = SEGMENT_SEED_MODE,
+    # Passthrough settings
+    output_prefix:           str   = OUTPUT_PREFIX,
+    **kwargs,
+) -> Optional[str]:
+    """
+    Generate an extended-length video using SVI-Pro-style segment iteration.
+    
+    Mirrors the SVI-Pro-Workflow.json approach:
+    1. Generate first segment from input image (81 frames)
+    2. Extract last frame as anchor for next segment
+    3. Generate next segment with overlap blending
+    4. Repeat for max_segments iterations
+    5. Stitch all segments with ImageBatchExtendWithOverlap-style blending
+    
+    Key SVI-Pro techniques applied:
+    - Two-model architecture (HIGH/LOW noise passes via generate_pro)
+    - 81 frames per segment (~5s at 16fps)
+    - 5-frame linear blend overlap for seamless transitions
+    - Fixed seed for reproducible generation
+    - Character anchor maintained across all segments
+    
+    Returns: Final stitched video path, or None on failure.
+    """
+    import shutil
+    
+    t0 = time.time()
+    print("=" * 70)
+    print("🎬 SVI-Pro Extended Video Generation")
+    print(f"   Segments     : {max_segments} x {segment_length} frames")
+    print(f"   Overlap      : {overlap_frames} frames ({overlap_mode})")
+    print(f"   Target length: ~{(max_segments * segment_length - (max_segments-1) * overlap_frames) / fps:.1f}s @ {fps}fps")
+    print(f"   Seed mode    : {segment_seed_mode} (base={seed})")
+    print("=" * 70)
+    
+    # Setup directories
+    cache_dir = f"/content/ComfyUI/output/{output_prefix}_segments"
+    os.makedirs(cache_dir, exist_ok=True)
+    
+    # Compute seeds for all segments
+    seeds = compute_segment_seeds(seed, max_segments, segment_seed_mode)
+    
+    # Track all generated frame tensors for final stitching
+    all_segment_paths = []
+    current_anchor_path = image_path  # Start with user's input image
+    
+    for seg_idx in range(max_segments):
+        seg_num = seg_idx + 1
+        print(f"\n{'─' * 50}")
+        print(f"📹 Segment {seg_num}/{max_segments} (seed={seeds[seg_idx]})")
+        
+        # Check for cached segment
+        cached_path = f"{cache_dir}/segment_{seg_idx:02d}.mp4"
+        anchor_path = f"{cache_dir}/anchor_{seg_idx:02d}.png"
+        
+        if os.path.exists(cached_path) and os.path.exists(anchor_path):
+            print(f"   ⏩ Using cached segment: {cached_path}")
+            all_segment_paths.append(cached_path)
+            current_anchor_path = anchor_path
+            continue
+        
+        # Generate this segment using generate_pro
+        seg_output = generate_pro(
+            user_input=user_input,
+            image_path=current_anchor_path,
+            positive_prompt=positive_prompt,
+            negative_prompt=negative_prompt,
+            width=width,
+            height=height,
+            frames=segment_length,
+            fps=fps,
+            seed=seeds[seg_idx],
+            image_strength=image_strength if seg_idx == 0 else character_strength,
+            character_image_path=character_image_path,
+            character_strength=character_strength,
+            character_mode=character_mode,
+            character_name=character_name,
+            character_description=character_description,
+            output_prefix=f"{output_prefix}_seg{seg_num:02d}",
+            **kwargs,
+        )
+        
+        if seg_output is None:
+            print(f"   ❌ Segment {seg_num} failed — stopping extension.")
+            break
+        
+        # Cache the segment
+        shutil.copy(seg_output, cached_path)
+        all_segment_paths.append(cached_path)
+        
+        # Extract last frame as anchor for next segment
+        last_frame_tensor = get_last_frame_tensor(cached_path)
+        if last_frame_tensor is not None:
+            anchor_pil = tensor_to_pil(last_frame_tensor)
+            anchor_pil.save(anchor_path, "PNG")
+            current_anchor_path = anchor_path
+            print(f"   ✓ Anchor frame saved: {anchor_path}")
+        else:
+            print(f"   ⚠️  Could not extract anchor — next segment may lack continuity.")
+        
+        # Cleanup between segments
+        aggressive_cleanup(f"segment {seg_num} done")
+    
+    # Final stitching with overlap blending
+    if len(all_segment_paths) < 1:
+        print("❌ No segments generated successfully.")
+        return None
+    
+    if len(all_segment_paths) == 1:
+        print(f"✅ Single segment generated: {all_segment_paths[0]}")
+        return all_segment_paths[0]
+    
+    print(f"\n{'═' * 50}")
+    print(f"🧵 Stitching {len(all_segment_paths)} segments with {overlap_frames}-frame {overlap_mode} overlap...")
+    
+    # Load all segments and blend
+    import imageio
+    
+    combined_frames = None
+    for seg_idx, seg_path in enumerate(all_segment_paths):
+        reader = imageio.get_reader(seg_path)
+        frames_list = []
+        for frame in reader:
+            frames_list.append(frame)
+        reader.close()
+        
+        seg_tensor = torch.from_numpy(np.stack(frames_list)).float() / 255.0
+        
+        if combined_frames is None:
+            combined_frames = seg_tensor
+        else:
+            # Apply overlap blending (mirrors ImageBatchExtendWithOverlap)
+            combined_frames = blend_overlap_frames(
+                combined_frames, seg_tensor,
+                overlap=overlap_frames,
+                mode=overlap_mode,
+                side=overlap_side
+            )
+        
+        print(f"   ✓ Segment {seg_idx + 1} merged (total frames: {len(combined_frames)})")
+    
+    # Save final stitched video
+    final_frames_np = (combined_frames.cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+    final_path = f"/content/ComfyUI/output/{output_prefix}_extended_{int(time.time())}.mp4"
+    imageio.mimsave(final_path, [f for f in final_frames_np], fps=fps, codec='libx264')
+    
+    elapsed = time.time() - t0
+    total_duration = len(combined_frames) / fps
+    
+    print(f"\n{'═' * 70}")
+    print(f"🎉 EXTENDED VIDEO COMPLETE!")
+    print(f"   Output    : {final_path}")
+    print(f"   Duration  : {total_duration:.1f}s ({len(combined_frames)} frames @ {fps}fps)")
+    print(f"   Segments  : {len(all_segment_paths)}")
+    print(f"   Elapsed   : {elapsed/60:.1f} minutes")
+    print(f"{'═' * 70}")
+    
+    # Display if enabled
+    if SHOW_PREVIEWS:
+        display_video(final_path)
+    
+    return final_path
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2099,13 +2451,48 @@ def run_storyboard(
         remaining = avg_per_clip * (len(scenes) - i - 1)
         print(f"   \u23f1\ufe0f  Elapsed: {elapsed/60:.1f}min | Est. remaining: {remaining/60:.1f}min")
 
-    # ── Final concatenation ───────────────────────────────────────────────
+    # ── Final concatenation with overlap blending ─────────────────────────
     successful_clips = [p for p in outputs if p]
     if len(successful_clips) >= 2:
         final_path = f"/content/ComfyUI/output/{scenes[0].get('output_prefix', OUTPUT_PREFIX)}_full.mp4"
-        concat_result = concatenate_clips(successful_clips, final_path)
-        if concat_result:
-            print(f"   \U0001f3ac Final video: {concat_result}")
+        
+        if OVERLAP_FRAMES > 0 and OVERLAP_MODE != "hard_cut":
+            # Use SVI-Pro style overlap blending for seamless transitions
+            print(f"   🧵 Stitching with {OVERLAP_FRAMES}-frame {OVERLAP_MODE} overlap...")
+            try:
+                import imageio
+                combined_frames = None
+                for clip_path in successful_clips:
+                    reader = imageio.get_reader(clip_path)
+                    frames_list = [frame for frame in reader]
+                    reader.close()
+                    seg_tensor = torch.from_numpy(np.stack(frames_list)).float() / 255.0
+                    
+                    if combined_frames is None:
+                        combined_frames = seg_tensor
+                    else:
+                        combined_frames = blend_overlap_frames(
+                            combined_frames, seg_tensor,
+                            overlap=OVERLAP_FRAMES,
+                            mode=OVERLAP_MODE,
+                            side=OVERLAP_SIDE
+                        )
+                
+                if combined_frames is not None:
+                    final_np = (combined_frames.cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+                    import imageio
+                    imageio.mimsave(final_path, [f for f in final_np], fps=FPS, codec='libx264')
+                    print(f"   🎬 Final video (overlap-blended): {final_path}")
+                    concat_result = final_path
+                else:
+                    concat_result = concatenate_clips(successful_clips, final_path)
+            except Exception as e:
+                print(f"   ⚠️  Overlap blending failed ({e}) — falling back to hard concat.")
+                concat_result = concatenate_clips(successful_clips, final_path)
+        else:
+            concat_result = concatenate_clips(successful_clips, final_path)
+            if concat_result:
+                print(f"   🎬 Final video: {concat_result}")
 
     # ── Summary ───────────────────────────────────────────────────────────
     print("\n" + "\u2550" * 70)
@@ -2150,6 +2537,56 @@ try:
         output = storyboard_outputs[-1] if storyboard_outputs else None
         if AUTO_INCREMENT_SEED:
             SEED = _current_seed + len(SCENES)
+            print(f"🔢 Next seed: {SEED}")
+
+    elif USE_SEGMENT_EXTENSION:
+        # ── SVI-Pro extended video mode ───────────────────────────────────
+        print("🎬 Running SVI-Pro segment extension mode…")
+        output = generate_extended_video(
+            user_input             = USER_INPUT,
+            image_path             = IMAGE_PATH,
+            positive_prompt        = POSITIVE_PROMPT,
+            negative_prompt        = NEGATIVE_PROMPT,
+            width                  = WIDTH,
+            height                 = HEIGHT,
+            fps                    = FPS,
+            seed                   = _current_seed,
+            image_strength         = IMAGE_STRENGTH,
+            character_image_path   = CHARACTER_IMAGE_PATH,
+            character_strength     = CHARACTER_STRENGTH,
+            character_mode         = CHARACTER_CONSISTENCY_MODE,
+            character_name         = CHARACTER_NAME,
+            character_description  = CHARACTER_DESCRIPTION,
+            segment_length         = SEGMENT_LENGTH,
+            max_segments           = MAX_SEGMENTS,
+            overlap_frames         = OVERLAP_FRAMES,
+            overlap_mode           = OVERLAP_MODE,
+            overlap_side           = OVERLAP_SIDE,
+            segment_seed_mode      = SEGMENT_SEED_MODE,
+            output_prefix          = OUTPUT_PREFIX,
+            # Pass through sampling settings
+            pass1_sigmas           = PASS1_SIGMAS,
+            pass1_sampler          = PASS1_SAMPLER,
+            pass1_cfg              = PASS1_CFG,
+            pass2_sigmas           = PASS2_SIGMAS,
+            pass2_sampler          = PASS2_SAMPLER,
+            pass2_cfg              = PASS2_CFG,
+            pass2_seed             = PASS2_SEED,
+            pro_mode               = PRO_MODE,
+            pro_steps              = PRO_STEPS,
+            pro_scheduler          = PRO_SCHEDULER,
+            pro_split_at           = PRO_SPLIT_AT,
+            use_tiled_vae          = USE_TILED_VAE,
+            tiled_spatial_tiles    = TILED_SPATIAL_TILES,
+            tiled_spatial_overlap  = TILED_SPATIAL_OVERLAP,
+            tiled_temporal_len     = TILED_TEMPORAL_LEN,
+            tiled_temporal_overlap = TILED_TEMPORAL_OVERLAP,
+            tiled_last_frame_fix   = TILED_LAST_FRAME_FIX,
+            lora_stack             = LORA_STACK,
+            lora_stack_json        = LORA_STACK_JSON,
+        )
+        if AUTO_INCREMENT_SEED:
+            SEED = _current_seed + MAX_SEGMENTS
             print(f"🔢 Next seed: {SEED}")
 
     else:

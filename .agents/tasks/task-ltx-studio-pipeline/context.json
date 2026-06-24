@@ -1,0 +1,20 @@
+{
+  "project_type": "Google Colab notebook script for AI video generation using LTX-2 19B model via ComfyUI nodes",
+  "language": "Python",
+  "build_system": "None (Colab notebook - pip install at runtime, shell commands for setup)",
+  "test_framework": "None (manual verification - script is a Colab notebook, no test suite)",
+  "build_command": "python -c \"import ast; ast.parse(open('/projects/sandbox/ms/LTX_Studio_Pipeline.py').read()); print('Syntax OK')\"",
+  "test_command": "python -c \"import ast; ast.parse(open('/projects/sandbox/ms/LTX_Studio_Pipeline.py').read()); print('AST validation passed')\"",
+  "verification_instructions": "1. Run AST parse to confirm valid Python syntax. 2. Verify file structure matches Colab cell layout with @title markers. 3. Check all required features are present (CharacterBible, VisionDescribe, EasyPrompt, generate_clip, ProductionEngine).",
+  "snapshot_or_generated_files": null,
+  "setup_instructions": "No setup needed - this is a standalone .py file that self-installs in Colab.",
+  "environment_constraints": "INTEGRATIONS_ONLY network - cannot install packages or run ComfyUI. Validation must use AST parsing only. No Docker daemon available.",
+  "contribution_requirements": "Single file output: /projects/sandbox/ms/LTX_Studio_Pipeline.py. Must be syntactically valid Python. Must follow Colab cell marker convention (# @title, # @markdown).",
+  "key_patterns": "1. CLIP-first-then-UNet memory pattern (load CLIP, encode, delete CLIP, then load UNet). 2. aggressive_cleanup() between stages. 3. ResizeImageMaskNode.EXECUTE_NORMALIZED() with 'scale dimensions' for I2V. 4. Two-pass sampling: Pass1 (euler + ManualSigmas) then Pass2 (gradient_estimation + LTXVLatentUpsampler). 5. NODE_CLASS_MAPPINGS dict for ComfyUI node access. 6. get_value_at_index() for node output extraction. 7. CharacterBible injects [NON-NEGOTIABLE] block into prompts. 8. Last-frame extraction via cv2.VideoCapture for scene chaining. 9. VisionDescribeEngine uses Qwen2.5-VL standalone. 10. EasyPromptEngine uses abliterated LLMs for prompt expansion.",
+  "relevant_files": [
+    "/projects/sandbox/ms/LTX_PRO.py",
+    "/projects/sandbox/ms/LTX2_InfiniteFlow_12Scene.py",
+    "/projects/sandbox/ms/LTX2_Infinite_Flow_PRO_v2.py"
+  ],
+  "directory_structure": "/projects/sandbox/ms/ - flat directory containing .py pipeline scripts and .json workflow files"
+}

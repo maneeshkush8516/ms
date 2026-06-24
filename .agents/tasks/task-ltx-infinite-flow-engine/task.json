@@ -1,0 +1,7 @@
+{
+  "task_id": "task-ltx-infinite-flow-engine",
+  "task_description": "Complete rewrite of /projects/sandbox/ms/LTX.PY as a 10-cell Google Colab notebook implementing the LTX Studio Infinite Flow Engine pipeline with Character Consistency, Easy Prompt Logic, T4 GPU optimization, Voice Sync hooks, SVI-Pro chaining, and Story-to-Prompt workflow.",
+  "status": "in_progress",
+  "feature_order": ["FEAT-001"],
+  "blocked_reason": null
+}

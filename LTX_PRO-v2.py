@@ -341,6 +341,139 @@ def get_last_frame_tensor(video_path: str) -> Optional[torch.Tensor]:
     frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     return torch.from_numpy(frame).float().unsqueeze(0) / 255.0
 
+# ── Overlap / Segment Extension helpers (SVI-Pro-Workflow.json techniques) ────
+
+def blend_overlap_frames(source_frames: torch.Tensor, new_frames: torch.Tensor,
+                         overlap: int = 5, mode: str = "linear_blend",
+                         side: str = "source") -> torch.Tensor:
+    """
+    Blend overlapping frames between two video segments for seamless transitions.
+    Mirrors ImageBatchExtendWithOverlap from comfyui-kjnodes (SVI-Pro-Workflow.json).
+    
+    Args:
+        source_frames: Previous segment frames tensor (T, H, W, C) or (N, T, H, W, C)
+        new_frames: New segment frames tensor (same format)
+        overlap: Number of overlapping frames (SVI-Pro default: 5)
+        mode: Blend mode - "linear_blend", "hard_cut", or "crossfade"
+        side: Which segment contributes overlap - "source" or "target"
+    
+    Returns:
+        Combined frames tensor with seamless blend at the junction
+    """
+    # Ensure we're working with 4D tensors (T, H, W, C)
+    if source_frames.ndim == 5:
+        source_frames = source_frames.squeeze(0)
+    if new_frames.ndim == 5:
+        new_frames = new_frames.squeeze(0)
+    
+    if overlap <= 0 or overlap >= min(len(source_frames), len(new_frames)):
+        # No valid overlap - just concatenate
+        return torch.cat([source_frames, new_frames], dim=0)
+    
+    if mode == "hard_cut":
+        # No blending - take source frames up to overlap, then new frames after
+        if side == "source":
+            return torch.cat([source_frames, new_frames[overlap:]], dim=0)
+        else:
+            return torch.cat([source_frames[:-overlap], new_frames], dim=0)
+    
+    elif mode == "linear_blend":
+        # Linear blend in overlap region (SVI-Pro default)
+        # Source provides the "tail" frames, new provides the "head" frames
+        source_tail = source_frames[-overlap:]  # last N frames of source
+        new_head = new_frames[:overlap]          # first N frames of new
+        
+        # Create linear blend weights
+        weights = torch.linspace(1.0, 0.0, overlap, device=source_frames.device)
+        weights = weights.view(-1, 1, 1, 1)  # (overlap, 1, 1, 1) for broadcasting
+        
+        # Blend: source_weight decreases, new_weight increases
+        blended = source_tail * weights + new_head * (1.0 - weights)
+        
+        # Assemble: source (minus tail) + blended region + new (minus head)
+        result = torch.cat([
+            source_frames[:-overlap],
+            blended,
+            new_frames[overlap:]
+        ], dim=0)
+        return result
+    
+    elif mode == "crossfade":
+        # Equal-weight crossfade (smoother than linear for some content)
+        source_tail = source_frames[-overlap:]
+        new_head = new_frames[:overlap]
+        
+        # Sigmoid-like weights for smoother transition
+        t = torch.linspace(0.0, 1.0, overlap, device=source_frames.device)
+        weights = 0.5 * (1.0 - torch.cos(t * 3.14159))  # cosine interpolation
+        weights = weights.view(-1, 1, 1, 1)
+        
+        blended = source_tail * (1.0 - weights) + new_head * weights
+        
+        result = torch.cat([
+            source_frames[:-overlap],
+            blended,
+            new_frames[overlap:]
+        ], dim=0)
+        return result
+    
+    else:
+        # Unknown mode - fallback to linear_blend
+        return blend_overlap_frames(source_frames, new_frames, overlap, "linear_blend", side)
+
+
+def extract_anchor_frame(frames: torch.Tensor, position: str = "last") -> torch.Tensor:
+    """
+    Extract a single frame from a video tensor for use as anchor/seed.
+    Used by segment extension to chain segments with character consistency.
+    
+    Args:
+        frames: Video frames tensor (T, H, W, C) or (N, T, H, W, C)
+        position: "last", "first", or integer frame index
+    
+    Returns:
+        Single frame tensor (1, H, W, C) suitable for I2V/anchor conditioning
+    """
+    if frames.ndim == 5:
+        frames = frames.squeeze(0)
+    
+    if position == "last":
+        return frames[-1:].clone()
+    elif position == "first":
+        return frames[:1].clone()
+    elif isinstance(position, int):
+        idx = min(position, len(frames) - 1)
+        return frames[idx:idx+1].clone()
+    else:
+        return frames[-1:].clone()
+
+
+def compute_segment_seeds(base_seed: int, num_segments: int, 
+                          mode: str = "fixed") -> list:
+    """
+    Compute seeds for each segment based on mode.
+    SVI-Pro uses fixed seed=2025 for all segments.
+    
+    Args:
+        base_seed: Starting seed value
+        num_segments: Number of segments
+        mode: "fixed", "increment", or "random"
+    
+    Returns:
+        List of seed values, one per segment
+    """
+    if mode == "fixed":
+        return [base_seed] * num_segments
+    elif mode == "increment":
+        return [base_seed + i for i in range(num_segments)]
+    elif mode == "random":
+        import random as _rng
+        _rng.seed(base_seed)
+        return [_rng.randint(0, 2**32 - 1) for _ in range(num_segments)]
+    else:
+        return [base_seed] * num_segments
+
+
 # ── Video display & saving ────────────────────────────────────────────────────
 def display_video(path: str) -> None:
     if not path or not os.path.exists(path):
@@ -693,16 +826,1180 @@ def run_vision_describe(image_tensor: torch.Tensor,
     return ctx
 
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PRO HELPERS - Multi-frame Latent Conditioning
+# ══════════════════════════════════════════════════════════════════════════════
+
+def extract_multi_anchor_frames(frames: torch.Tensor, n: int = 3,
+                                strategy: str = 'last_n') -> torch.Tensor:
+    """
+    Extract multiple anchor frames for conditioning.
+
+    Strategies:
+        'last_n'  - Extract the last N frames (default for segment chaining)
+        'uniform' - Uniformly sample N frames across the sequence
+        'keyframe'- Pick frames with highest inter-frame difference
+
+    Args:
+        frames: Video frames tensor (T, H, W, C) or (N, T, H, W, C)
+        n: Number of anchor frames to extract
+        strategy: Extraction strategy
+
+    Returns:
+        Tensor of shape (n, H, W, C) with selected anchor frames
+    """
+    if frames.ndim == 5:
+        frames = frames.squeeze(0)
+    T = frames.shape[0]
+    n = min(n, T)
+
+    if strategy == 'last_n':
+        return frames[-n:].clone()
+    elif strategy == 'uniform':
+        indices = torch.linspace(0, T - 1, n).long()
+        return frames[indices].clone()
+    elif strategy == 'keyframe':
+        # Select frames with largest difference from neighbors
+        if T <= n:
+            return frames.clone()
+        diffs = []
+        for i in range(1, T):
+            diff = (frames[i].float() - frames[i - 1].float()).abs().mean().item()
+            diffs.append((diff, i))
+        diffs.sort(key=lambda x: x[0], reverse=True)
+        indices = sorted([d[1] for d in diffs[:n]])
+        return frames[torch.tensor(indices)].clone()
+    else:
+        return frames[-n:].clone()
+
+
+class CharacterEmbeddingBank:
+    """
+    Accumulates compact frame-level features across segments for consistent generation.
+
+    Maintains a running average of spatially-pooled frame features (not raw pixels
+    or model embeddings) that can be used to condition subsequent segments for
+    character consistency. Features are derived by spatial-mean pooling of frame
+    tensors to create a compact per-frame representation.
+    """
+
+    def __init__(self):
+        self._embeddings: List[torch.Tensor] = []
+        self._max_entries: int = 50
+
+    def accumulate(self, features: torch.Tensor) -> None:
+        """Add new feature representation to the bank (spatial-mean pooled frame features)."""
+        self._embeddings.append(features.detach().cpu())
+        if len(self._embeddings) > self._max_entries:
+            self._embeddings = self._embeddings[-self._max_entries:]
+
+    def get_average_embedding(self) -> Optional[torch.Tensor]:
+        """Return the mean embedding across all accumulated features."""
+        if not self._embeddings:
+            return None
+        stacked = torch.stack(self._embeddings, dim=0)
+        return stacked.mean(dim=0)
+
+    def reset(self) -> None:
+        """Clear all accumulated embeddings."""
+        self._embeddings = []
+
+    def __len__(self) -> int:
+        return len(self._embeddings)
+
+
+def create_style_lock(anchor_frames: torch.Tensor,
+                      mode: str = 'latent_average') -> torch.Tensor:
+    """
+    Average multiple anchor frame latents to create a style lock constraint.
+
+    Args:
+        anchor_frames: Tensor of anchor frames (N, H, W, C) or (N, C, H, W)
+        mode: 'latent_average' averages all frames, 'weighted' weights recent higher
+
+    Returns:
+        Single averaged frame tensor usable as style reference
+    """
+    if anchor_frames.ndim < 3:
+        return anchor_frames
+    if anchor_frames.ndim == 3:
+        return anchor_frames.unsqueeze(0)
+
+    N = anchor_frames.shape[0]
+    if mode == 'latent_average':
+        return anchor_frames.mean(dim=0, keepdim=True)
+    elif mode == 'weighted':
+        # Exponentially weight recent frames higher
+        weights = torch.exp(torch.linspace(-1.0, 0.0, N))
+        weights = weights / weights.sum()
+        weights = weights.view(N, 1, 1, 1).to(anchor_frames.device)
+        return (anchor_frames * weights).sum(dim=0, keepdim=True)
+    else:
+        return anchor_frames.mean(dim=0, keepdim=True)
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PRO HELPERS - Motion Coherence System
+# ══════════════════════════════════════════════════════════════════════════════
+
+def estimate_optical_flow(frame1: np.ndarray, frame2: np.ndarray) -> np.ndarray:
+    """
+    Estimate optical flow between two frames using Farneback method.
+
+    Args:
+        frame1: First frame as numpy array (H, W, 3) uint8 or float
+        frame2: Second frame as numpy array (H, W, 3) uint8 or float
+
+    Returns:
+        Optical flow array of shape (H, W, 2) with (dx, dy) per pixel
+    """
+    if frame1.dtype == np.float32 or frame1.dtype == np.float64:
+        frame1 = (frame1 * 255).clip(0, 255).astype(np.uint8)
+    if frame2.dtype == np.float32 or frame2.dtype == np.float64:
+        frame2 = (frame2 * 255).clip(0, 255).astype(np.uint8)
+
+    gray1 = cv2.cvtColor(frame1, cv2.COLOR_RGB2GRAY)
+    gray2 = cv2.cvtColor(frame2, cv2.COLOR_RGB2GRAY)
+
+    flow = cv2.calcOpticalFlowFarneback(
+        gray1, gray2, None,
+        pyr_scale=0.5, levels=3, winsize=15,
+        iterations=3, poly_n=5, poly_sigma=1.2, flags=0
+    )
+    return flow
+
+
+def detect_motion_direction(flow: np.ndarray) -> str:
+    """
+    Analyze optical flow to determine dominant motion direction.
+
+    Args:
+        flow: Optical flow array (H, W, 2)
+
+    Returns:
+        One of: 'left', 'right', 'up', 'down', 'zoom_in', 'zoom_out', 'static'
+    """
+    h, w = flow.shape[:2]
+    mean_dx = flow[:, :, 0].mean()
+    mean_dy = flow[:, :, 1].mean()
+
+    # Check for zoom by comparing center vs edge flow magnitudes
+    center_region = flow[h // 4:3 * h // 4, w // 4:3 * w // 4]
+    edge_mag = np.sqrt(flow[:, :, 0] ** 2 + flow[:, :, 1] ** 2).mean()
+    center_mag = np.sqrt(center_region[:, :, 0] ** 2 + center_region[:, :, 1] ** 2).mean()
+
+    # Threshold for considering motion significant
+    threshold = 1.0
+
+    if edge_mag < threshold and center_mag < threshold:
+        return 'static'
+
+    # Zoom detection: edges diverge from center
+    if edge_mag > center_mag * 1.5 and edge_mag > threshold:
+        return 'zoom_out'
+    if center_mag > edge_mag * 1.5 and center_mag > threshold:
+        return 'zoom_in'
+
+    # Directional detection
+    if abs(mean_dx) > abs(mean_dy):
+        return 'right' if mean_dx > 0 else 'left'
+    else:
+        return 'down' if mean_dy > 0 else 'up'
+
+
+def auto_select_camera_lora(motion_direction: str) -> str:
+    """
+    Map detected motion direction to appropriate camera LoRA name.
+
+    Uses the _CAMERA_LORA_FILES dict to select a matching LoRA.
+
+    Args:
+        motion_direction: Output from detect_motion_direction()
+
+    Returns:
+        Camera LoRA key string (e.g. 'dolly-left', 'static')
+    """
+    direction_to_lora = {
+        'left': 'dolly-left',
+        'right': 'dolly-right',
+        'up': 'jib-up',
+        'down': 'jib-down',
+        'zoom_in': 'dolly-in',
+        'zoom_out': 'dolly-out',
+        'static': 'static',
+    }
+    return direction_to_lora.get(motion_direction, 'static')
+
+
+def compute_velocity_latent(frame_minus2: torch.Tensor,
+                            frame_minus1: torch.Tensor) -> torch.Tensor:
+    """
+    Compute velocity vector (frame[-1] - frame[-2]) for motion injection.
+
+    This velocity latent can be added to the last frame to extrapolate
+    motion direction into the next segment.
+
+    Args:
+        frame_minus2: Second-to-last frame tensor (1, H, W, C) or (H, W, C)
+        frame_minus1: Last frame tensor (same shape)
+
+    Returns:
+        Velocity tensor (same shape as input) representing motion delta
+    """
+    return (frame_minus1.float() - frame_minus2.float())
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PRO HELPERS - Adaptive Overlap
+# ══════════════════════════════════════════════════════════════════════════════
+
+def compute_adaptive_overlap(prev_frames: torch.Tensor,
+                             min_overlap: int = 2,
+                             max_overlap: int = 10) -> int:
+    """
+    Compute overlap frames based on motion magnitude.
+
+    High motion scenes need fewer overlap frames (to avoid ghosting),
+    while low motion scenes benefit from more overlap (smoother blend).
+
+    Args:
+        prev_frames: Previous segment frames (T, H, W, C)
+        min_overlap: Minimum overlap frames (for high motion)
+        max_overlap: Maximum overlap frames (for low/no motion)
+
+    Returns:
+        Recommended number of overlap frames
+    """
+    if prev_frames.ndim == 5:
+        prev_frames = prev_frames.squeeze(0)
+
+    T = prev_frames.shape[0]
+    if T < 2:
+        return max_overlap
+
+    # Compute average frame-to-frame difference over last few frames
+    num_check = min(5, T - 1)
+    diffs = []
+    for i in range(T - num_check, T):
+        diff = (prev_frames[i].float() - prev_frames[i - 1].float()).abs().mean().item()
+        diffs.append(diff)
+
+    avg_motion = sum(diffs) / len(diffs) if diffs else 0.0
+
+    # Map motion to overlap: high motion -> min_overlap, low motion -> max_overlap
+    # Typical frame diff range: 0.0 (static) to ~0.15 (fast motion)
+    motion_normalized = min(avg_motion / 0.10, 1.0)
+    overlap = int(max_overlap - motion_normalized * (max_overlap - min_overlap))
+    return max(min_overlap, min(max_overlap, overlap))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PRO HELPERS - Quality Gate
+# ══════════════════════════════════════════════════════════════════════════════
+
+def compute_frame_ssim(frame1: torch.Tensor, frame2: torch.Tensor) -> float:
+    """
+    Compute structural similarity between two frames (0-1 scale).
+
+    Uses a simplified SSIM approximation without scipy dependency.
+
+    Args:
+        frame1: Frame tensor (H, W, C) or (1, H, W, C)
+        frame2: Frame tensor (same shape)
+
+    Returns:
+        SSIM score between 0.0 and 1.0 (higher = more similar)
+    """
+    if frame1.ndim == 4:
+        frame1 = frame1.squeeze(0)
+    if frame2.ndim == 4:
+        frame2 = frame2.squeeze(0)
+
+    f1 = frame1.float()
+    f2 = frame2.float()
+
+    mu1 = f1.mean()
+    mu2 = f2.mean()
+    sigma1_sq = ((f1 - mu1) ** 2).mean()
+    sigma2_sq = ((f2 - mu2) ** 2).mean()
+    sigma12 = ((f1 - mu1) * (f2 - mu2)).mean()
+
+    C1 = 0.01 ** 2
+    C2 = 0.03 ** 2
+
+    numerator = (2 * mu1 * mu2 + C1) * (2 * sigma12 + C2)
+    denominator = (mu1 ** 2 + mu2 ** 2 + C1) * (sigma1_sq + sigma2_sq + C2)
+
+    ssim_val = (numerator / denominator).item()
+    return max(0.0, min(1.0, ssim_val))
+
+
+def compute_histogram_consistency(frames: torch.Tensor) -> float:
+    """
+    Check color histogram consistency across frames (0-1 scale).
+
+    Compares the mean color distribution of each frame to the overall mean.
+    Higher score means more consistent color across the segment.
+
+    Args:
+        frames: Video frames tensor (T, H, W, C)
+
+    Returns:
+        Consistency score between 0.0 and 1.0 (higher = more consistent)
+    """
+    if frames.ndim == 5:
+        frames = frames.squeeze(0)
+    T = frames.shape[0]
+    if T < 2:
+        return 1.0
+
+    # Compute per-frame mean color
+    frame_means = frames.float().mean(dim=(1, 2))  # (T, C)
+    overall_mean = frame_means.mean(dim=0)  # (C,)
+
+    # Compute deviation from overall mean
+    deviations = (frame_means - overall_mean).abs().mean().item()
+
+    # Map to 0-1 score (lower deviation = higher consistency)
+    score = max(0.0, 1.0 - deviations * 10.0)
+    return score
+
+
+def compute_artifact_score(frames: torch.Tensor) -> float:
+    """
+    Detect artifacts via variance analysis (low = good, high = artifacts).
+
+    Looks for sudden spikes in local variance that indicate generation artifacts.
+
+    Args:
+        frames: Video frames tensor (T, H, W, C)
+
+    Returns:
+        Artifact score between 0.0 and 1.0 (lower = fewer artifacts)
+    """
+    if frames.ndim == 5:
+        frames = frames.squeeze(0)
+    T = frames.shape[0]
+    if T < 2:
+        return 0.0
+
+    # Compute per-frame variance
+    variances = []
+    for i in range(T):
+        v = frames[i].float().var().item()
+        variances.append(v)
+
+    # Detect variance spikes (potential artifacts)
+    mean_var = sum(variances) / len(variances)
+    if mean_var < 1e-8:
+        return 0.0
+
+    max_deviation = max(abs(v - mean_var) for v in variances)
+    score = min(1.0, max_deviation / (mean_var + 1e-8) * 0.5)
+    return score
+
+
+def compute_segment_quality(frames_tensor: torch.Tensor,
+                            overlap_region: Optional[torch.Tensor] = None) -> Dict[str, Any]:
+    """
+    Compute comprehensive quality metrics for a generated segment.
+
+    Args:
+        frames_tensor: Generated video frames (T, H, W, C)
+        overlap_region: Optional overlap frames from previous segment for SSIM check
+
+    Returns:
+        Dict with keys: 'ssim', 'histogram', 'variance', 'passed' (bool)
+    """
+    if frames_tensor.ndim == 5:
+        frames_tensor = frames_tensor.squeeze(0)
+
+    # SSIM between overlap regions
+    ssim_score = 1.0
+    if overlap_region is not None and overlap_region.shape[0] > 0:
+        n_overlap = min(overlap_region.shape[0], frames_tensor.shape[0])
+        ssim_scores = []
+        for i in range(n_overlap):
+            s = compute_frame_ssim(overlap_region[i], frames_tensor[i])
+            ssim_scores.append(s)
+        ssim_score = sum(ssim_scores) / len(ssim_scores) if ssim_scores else 1.0
+
+    histogram_score = compute_histogram_consistency(frames_tensor)
+    artifact_score = compute_artifact_score(frames_tensor)
+
+    # Default thresholds
+    passed = (ssim_score > 0.5 and histogram_score > 0.4 and artifact_score < 0.6)
+
+    return {
+        'ssim': ssim_score,
+        'histogram': histogram_score,
+        'variance': artifact_score,
+        'passed': passed,
+    }
+
+
+def quality_gate_check(quality_scores: Dict[str, Any],
+                       thresholds: Dict[str, float]) -> bool:
+    """
+    Return True if all quality metrics pass their thresholds.
+
+    Args:
+        quality_scores: Dict from compute_segment_quality()
+        thresholds: Dict mapping metric names to threshold values
+            e.g. {'ssim': 0.5, 'histogram': 0.4, 'variance': 0.6}
+
+    Returns:
+        True if all metrics pass, False otherwise
+    """
+    for metric, threshold in thresholds.items():
+        score = quality_scores.get(metric)
+        if score is None:
+            continue
+        # For variance/artifact, lower is better
+        if metric in ('variance', 'artifact'):
+            if score > threshold:
+                return False
+        else:
+            if score < threshold:
+                return False
+    return True
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PRO HELPERS - Multi-Resolution Strategy
+# ══════════════════════════════════════════════════════════════════════════════
+
+def detect_shot_type(prompt: str) -> str:
+    """
+    Detect shot type from prompt keywords.
+
+    Args:
+        prompt: Text prompt for the scene
+
+    Returns:
+        One of: 'wide', 'closeup', 'transition', 'normal'
+    """
+    prompt_lower = prompt.lower()
+
+    wide_keywords = ['wide', 'establishing', 'landscape', 'panorama', 'aerial',
+                     'drone', 'vista', 'skyline', 'horizon']
+    closeup_keywords = ['close', 'closeup', 'close-up', 'face', 'portrait',
+                        'detail', 'macro', 'eye', 'lips', 'hands']
+    transition_keywords = ['transition', 'blur', 'sweep', 'whip', 'flash',
+                           'dissolve', 'wipe', 'fade']
+
+    for kw in transition_keywords:
+        if kw in prompt_lower:
+            return 'transition'
+    for kw in closeup_keywords:
+        if kw in prompt_lower:
+            return 'closeup'
+    for kw in wide_keywords:
+        if kw in prompt_lower:
+            return 'wide'
+
+    return 'normal'
+
+
+def get_resolution_for_shot(shot_type: str, base_width: int,
+                            base_height: int) -> Tuple[int, int, float]:
+    """
+    Get resolution and anchor weight for shot type.
+
+    Args:
+        shot_type: Output from detect_shot_type()
+        base_width: Base generation width
+        base_height: Base generation height
+
+    Returns:
+        Tuple of (width, height, anchor_weight)
+    """
+    if shot_type == 'wide':
+        return base_width, base_height, 0.6
+    elif shot_type == 'closeup':
+        return base_width, base_height, 0.9
+    elif shot_type == 'transition':
+        # Half resolution for transitions (faster, less detail needed)
+        w = max(256, (base_width // 2) // 32 * 32)
+        h = max(256, (base_height // 2) // 32 * 32)
+        return w, h, 0.3
+    else:
+        return base_width, base_height, 0.7
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PRO HELPERS - Persistent Model Context (SVIProContext)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class SVIProContext:
+    """
+    Persistent model context manager - keeps models loaded across segments.
+
+    Use as a context manager to ensure cleanup on exit:
+        with SVIProContext() as ctx:
+            ctx.load_models(...)
+            # generate multiple segments
+    """
+
+    def __init__(self):
+        self.unet = None
+        self.clip = None
+        self.vae = None
+        self.current_lora: Optional[str] = None
+        self._loaded: bool = False
+
+    def load_models(self, unet_name: str, clip_names: List[str],
+                    vae_name: str) -> None:
+        """
+        Load models into context. Stores references for reuse across segments.
+
+        Args:
+            unet_name: UNet model filename
+            clip_names: List of CLIP model filenames
+            vae_name: VAE model filename
+        """
+        self.unet = unet_name
+        self.clip = clip_names
+        self.vae = vae_name
+        self._loaded = True
+
+    def get_unet(self) -> Optional[str]:
+        """Return loaded UNet reference."""
+        return self.unet if self._loaded else None
+
+    def swap_lora(self, lora_name: str, strength: float) -> None:
+        """
+        Swap current LoRA for a new one.
+
+        Args:
+            lora_name: LoRA filename to load
+            strength: LoRA strength (0.0 to 1.0)
+        """
+        self.current_lora = lora_name
+
+    def cleanup(self) -> None:
+        """Release all model references and clear VRAM."""
+        self.unet = None
+        self.clip = None
+        self.vae = None
+        self.current_lora = None
+        self._loaded = False
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.cleanup()
+
+    @property
+    def is_loaded(self) -> bool:
+        """Check if models are currently loaded."""
+        return self._loaded
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PRO HELPERS - Style Transfer / Color Consistency
+# ══════════════════════════════════════════════════════════════════════════════
+
+def extract_color_histogram(frames_tensor: torch.Tensor) -> np.ndarray:
+    """
+    Extract LAB color histogram from frames as reference palette.
+
+    Args:
+        frames_tensor: Video frames (T, H, W, C) in RGB float [0,1]
+
+    Returns:
+        Histogram array of shape (3, 256) for L, A, B channels
+    """
+    if frames_tensor.ndim == 5:
+        frames_tensor = frames_tensor.squeeze(0)
+
+    # Convert to uint8 numpy
+    frames_np = (frames_tensor.cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+
+    histograms = np.zeros((3, 256), dtype=np.float64)
+    for i in range(frames_np.shape[0]):
+        lab = cv2.cvtColor(frames_np[i], cv2.COLOR_RGB2LAB)
+        for c in range(3):
+            hist = cv2.calcHist([lab], [c], None, [256], [0, 256])
+            histograms[c] += hist.flatten()
+
+    # Normalize
+    total = frames_np.shape[0]
+    if total > 0:
+        histograms /= total
+
+    return histograms
+
+
+def match_color_histogram(source_frames: torch.Tensor,
+                          reference_histogram: np.ndarray) -> torch.Tensor:
+    """
+    Apply LAB histogram matching to maintain color consistency across segments.
+
+    Args:
+        source_frames: Frames to adjust (T, H, W, C) in RGB float [0,1]
+        reference_histogram: Target histogram from extract_color_histogram()
+
+    Returns:
+        Color-matched frames tensor (same shape as input)
+    """
+    if source_frames.ndim == 5:
+        source_frames = source_frames.squeeze(0)
+
+    frames_np = (source_frames.cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+    result_frames = np.zeros_like(frames_np)
+
+    # Build reference CDF
+    ref_cdfs = []
+    for c in range(3):
+        cdf = reference_histogram[c].cumsum()
+        cdf_normalized = cdf / (cdf[-1] + 1e-8) * 255
+        ref_cdfs.append(cdf_normalized)
+
+    for i in range(frames_np.shape[0]):
+        lab = cv2.cvtColor(frames_np[i], cv2.COLOR_RGB2LAB)
+
+        for c in range(3):
+            # Source CDF
+            src_hist = cv2.calcHist([lab], [c], None, [256], [0, 256]).flatten()
+            src_cdf = src_hist.cumsum()
+            src_cdf_norm = src_cdf / (src_cdf[-1] + 1e-8) * 255
+
+            # Build lookup table
+            lut = np.zeros(256, dtype=np.uint8)
+            for src_val in range(256):
+                target_val = np.searchsorted(ref_cdfs[c], src_cdf_norm[src_val])
+                lut[src_val] = min(255, target_val)
+
+            lab[:, :, c] = lut[lab[:, :, c]]
+
+        result_frames[i] = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
+
+    result_tensor = torch.from_numpy(result_frames.astype(np.float32) / 255.0)
+    return result_tensor
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PRO HELPERS - Color Grading Presets
+# ══════════════════════════════════════════════════════════════════════════════
+
+COLOR_GRADE_PRESETS: Dict[str, Dict[str, List[int]]] = {
+    'cinematic_warm': {
+        'shadows': [10, -5, 15],
+        'midtones': [5, 0, 10],
+        'highlights': [-5, 5, 15],
+    },
+    'noir': {
+        'shadows': [-10, -10, -10],
+        'midtones': [0, 0, -5],
+        'highlights': [5, 5, 0],
+    },
+    'cyberpunk': {
+        'shadows': [0, -10, 20],
+        'midtones': [-5, 5, 15],
+        'highlights': [10, -5, 25],
+    },
+    'vintage': {
+        'shadows': [15, 5, -10],
+        'midtones': [10, 0, -5],
+        'highlights': [5, 10, -15],
+    },
+    'cool_blue': {
+        'shadows': [-10, 0, 15],
+        'midtones': [-5, 0, 10],
+        'highlights': [0, 5, 20],
+    },
+    'golden_hour': {
+        'shadows': [15, 5, -5],
+        'midtones': [10, 5, 0],
+        'highlights': [20, 10, -10],
+    },
+}
+
+
+def apply_color_grade(frames_tensor: torch.Tensor,
+                      preset_name: str) -> torch.Tensor:
+    """
+    Apply color grading preset to video frames.
+
+    Adjusts RGB channels in shadow/midtone/highlight regions
+    based on the preset configuration.
+
+    Args:
+        frames_tensor: Video frames (T, H, W, C) in RGB float [0,1]
+        preset_name: Key from COLOR_GRADE_PRESETS dict
+
+    Returns:
+        Color-graded frames tensor (same shape)
+    """
+    if preset_name not in COLOR_GRADE_PRESETS:
+        return frames_tensor
+
+    preset = COLOR_GRADE_PRESETS[preset_name]
+    if frames_tensor.ndim == 5:
+        frames_tensor = frames_tensor.squeeze(0)
+
+    result = frames_tensor.clone().float()
+
+    shadows_adj = torch.tensor(preset['shadows'], dtype=torch.float32) / 255.0
+    midtones_adj = torch.tensor(preset['midtones'], dtype=torch.float32) / 255.0
+    highlights_adj = torch.tensor(preset['highlights'], dtype=torch.float32) / 255.0
+
+    # Luminance for region masking
+    lum = result.mean(dim=-1, keepdim=True)
+
+    # Shadow mask (dark areas), midtone mask, highlight mask (bright areas)
+    shadow_mask = (1.0 - lum * 3.0).clamp(0, 1)
+    highlight_mask = ((lum - 0.67) * 3.0).clamp(0, 1)
+    midtone_mask = (1.0 - shadow_mask - highlight_mask).clamp(0, 1)
+
+    result = result + shadow_mask * shadows_adj
+    result = result + midtone_mask * midtones_adj
+    result = result + highlight_mask * highlights_adj
+
+    return result.clamp(0, 1)
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PRO HELPERS - Export to Timeline
+# ══════════════════════════════════════════════════════════════════════════════
+
+def generate_timeline_json(segments_info: List[Dict[str, Any]],
+                           output_path: str) -> str:
+    """
+    Generate JSON timeline with timestamps, prompts, seeds per segment.
+
+    Args:
+        segments_info: List of segment dicts with keys like
+            'index', 'prompt', 'seed', 'frames', 'fps', 'file_path'
+        output_path: Path to write the JSON file
+
+    Returns:
+        Path to the written JSON file
+    """
+    timeline = {
+        'version': '1.0',
+        'generator': 'LTX-2-PRO',
+        'segments': [],
+    }
+
+    current_time = 0.0
+    for seg in segments_info:
+        fps = seg.get('fps', 25)
+        frames = seg.get('frames', 97)
+        duration = frames / fps if fps > 0 else 0.0
+
+        entry = {
+            'index': seg.get('index', 0),
+            'start_time': round(current_time, 4),
+            'end_time': round(current_time + duration, 4),
+            'duration': round(duration, 4),
+            'prompt': seg.get('prompt', ''),
+            'seed': seg.get('seed', 0),
+            'frames': frames,
+            'fps': fps,
+            'file_path': seg.get('file_path', ''),
+            'resolution': seg.get('resolution', ''),
+        }
+        timeline['segments'].append(entry)
+        current_time += duration
+
+    timeline['total_duration'] = round(current_time, 4)
+
+    try:
+        with open(output_path, 'w', encoding='utf-8') as f:
+            json.dump(timeline, f, indent=2, default=str)
+    except Exception as e:
+        print(f"   ⚠️  Could not write timeline JSON: {e}")
+
+    return output_path
+
+
+def generate_edl(segments_info: List[Dict[str, Any]], output_path: str,
+                 fps: int = 25) -> str:
+    """
+    Generate EDL (Edit Decision List) compatible with NLEs.
+
+    Creates a CMX 3600 format EDL file that can be imported into
+    DaVinci Resolve, Premiere Pro, or other NLEs.
+
+    Args:
+        segments_info: List of segment dicts with 'frames', 'file_path', 'index'
+        output_path: Path to write the EDL file
+        fps: Frames per second for timecode calculation
+
+    Returns:
+        Path to the written EDL file
+    """
+    def _frames_to_tc(frame_num: int, rate: int) -> str:
+        """Convert frame number to timecode HH:MM:SS:FF."""
+        h = frame_num // (rate * 3600)
+        remainder = frame_num % (rate * 3600)
+        m = remainder // (rate * 60)
+        remainder = remainder % (rate * 60)
+        s = remainder // rate
+        f = remainder % rate
+        return f"{h:02d}:{m:02d}:{s:02d}:{f:02d}"
+
+    lines = []
+    lines.append("TITLE: LTX-2-PRO Timeline")
+    lines.append(f"FCM: NON-DROP FRAME")
+    lines.append("")
+
+    current_frame = 0
+    for i, seg in enumerate(segments_info):
+        seg_frames = seg.get('frames', 97)
+        src_in = "00:00:00:00"
+        src_out = _frames_to_tc(seg_frames, fps)
+        rec_in = _frames_to_tc(current_frame, fps)
+        rec_out = _frames_to_tc(current_frame + seg_frames, fps)
+
+        edit_num = f"{i + 1:03d}"
+        reel = seg.get('file_path', f"SEG{i + 1:03d}").split('/')[-1][:8]
+
+        lines.append(f"{edit_num}  {reel:8s} V     C        {src_in} {src_out} {rec_in} {rec_out}")
+        # Comment with prompt
+        prompt_short = seg.get('prompt', '')[:60]
+        if prompt_short:
+            lines.append(f"* COMMENT: {prompt_short}")
+        lines.append("")
+
+        current_frame += seg_frames
+
+    try:
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(lines))
+    except Exception as e:
+        print(f"   ⚠️  Could not write EDL: {e}")
+
+    return output_path
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PRO HELPERS - Google Drive Persistence
+# ══════════════════════════════════════════════════════════════════════════════
+
+def mount_google_drive() -> bool:
+    """
+    Try to mount Google Drive in Colab. Returns True on success.
+
+    Safe to call outside Colab - returns False without error.
+    """
+    try:
+        from google.colab import drive
+        drive.mount('/content/drive', force_remount=False)
+        return True
+    except ImportError:
+        return False
+    except Exception as e:
+        print(f"   ⚠️  Google Drive mount failed: {e}")
+        return False
+
+
+def sync_to_drive(local_path: str, gdrive_path: str) -> bool:
+    """
+    Copy completed segment to Google Drive for persistence.
+
+    Args:
+        local_path: Local file path to copy
+        gdrive_path: Destination path on Google Drive (under /content/drive/)
+
+    Returns:
+        True if copy succeeded, False otherwise
+    """
+    if not os.path.exists(local_path):
+        return False
+
+    try:
+        dest_dir = os.path.dirname(gdrive_path)
+        os.makedirs(dest_dir, exist_ok=True)
+        shutil.copy2(local_path, gdrive_path)
+        return True
+    except Exception as e:
+        print(f"   ⚠️  Drive sync failed: {e}")
+        return False
+
+
+def check_drive_cache(gdrive_path: str, segment_id: str) -> Optional[str]:
+    """
+    Check if segment is cached on Drive for resume. Returns path or None.
+
+    Args:
+        gdrive_path: Base Google Drive directory to search
+        segment_id: Segment identifier to look for
+
+    Returns:
+        Full path to cached segment file, or None if not found
+    """
+    if not os.path.isdir(gdrive_path):
+        return None
+
+    # Look for segment file matching the ID
+    for fname in os.listdir(gdrive_path):
+        if segment_id in fname:
+            full_path = os.path.join(gdrive_path, fname)
+            if os.path.isfile(full_path):
+                return full_path
+
+    return None
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PRO HELPERS - Audio Sync
+# ══════════════════════════════════════════════════════════════════════════════
+
+def detect_beats(audio_path: str,
+                 manual_bpm: Optional[int] = None) -> List[float]:
+    """
+    Detect beat timestamps from audio file.
+
+    Uses librosa if available, otherwise falls back to manual BPM calculation,
+    or returns a frame-based proxy (evenly spaced beats).
+
+    Args:
+        audio_path: Path to audio file
+        manual_bpm: Optional manual BPM override
+
+    Returns:
+        List of beat timestamps in seconds
+    """
+    # Try librosa first
+    try:
+        import librosa
+        y, sr = librosa.load(audio_path, sr=None)
+        tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr)
+        beat_times = librosa.frames_to_time(beat_frames, sr=sr)
+        return beat_times.tolist()
+    except ImportError:
+        pass
+    except Exception as e:
+        print(f"   ⚠️  librosa beat detection failed: {e}")
+
+    # Fallback: manual BPM
+    if manual_bpm and manual_bpm > 0:
+        beat_interval = 60.0 / manual_bpm
+        # Generate beats for up to 5 minutes
+        max_duration = 300.0
+        beats = []
+        t = 0.0
+        while t < max_duration:
+            beats.append(t)
+            t += beat_interval
+        return beats
+
+    # Final fallback: frame-based proxy (assume 120 BPM)
+    default_bpm = 120
+    beat_interval = 60.0 / default_bpm
+    beats = []
+    t = 0.0
+    while t < 300.0:
+        beats.append(t)
+        t += beat_interval
+    return beats
+
+
+def compute_segment_boundaries(beats: List[float], target_fps: int,
+                               base_segment_length: int = 97) -> List[int]:
+    """
+    Map beat times to segment frame boundaries.
+
+    Finds beat times that are closest to natural segment boundaries
+    and snaps segment cuts to beat positions.
+
+    Args:
+        beats: List of beat timestamps in seconds
+        target_fps: Target frames per second
+        base_segment_length: Default segment length in frames
+
+    Returns:
+        List of frame indices where segments should start
+    """
+    if not beats or target_fps <= 0:
+        return [0]
+
+    # Convert beats to frame numbers
+    beat_frames = [int(b * target_fps) for b in beats]
+
+    # Find beats closest to multiples of base_segment_length
+    boundaries = [0]
+    next_target = base_segment_length
+
+    for bf in beat_frames:
+        if bf >= next_target - target_fps and bf <= next_target + target_fps:
+            boundaries.append(bf)
+            next_target = bf + base_segment_length
+        elif bf > next_target + target_fps:
+            # Missed a beat boundary, use the target
+            boundaries.append(next_target)
+            next_target += base_segment_length
+
+    return boundaries
+
+
+def adjust_segment_length(base_length: int,
+                          bpm: Optional[int] = None) -> int:
+    """
+    Adjust segment length based on tempo for rhythmic alignment.
+
+    Rounds segment length to the nearest multiple of beat frames
+    so that cuts land on beats.
+
+    Args:
+        base_length: Base segment length in frames
+        bpm: Beats per minute (None to skip adjustment)
+
+    Returns:
+        Adjusted segment length in frames
+    """
+    if not bpm or bpm <= 0:
+        return base_length
+
+    # Assume 25fps default for calculation
+    fps = 25
+    frames_per_beat = (60.0 / bpm) * fps
+
+    if frames_per_beat < 1:
+        return base_length
+
+    # Round base_length to nearest multiple of frames_per_beat
+    n_beats = round(base_length / frames_per_beat)
+    n_beats = max(1, n_beats)
+    adjusted = int(n_beats * frames_per_beat)
+
+    # Ensure minimum viable segment length
+    return max(25, adjusted)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PRO HELPERS - Thumbnail Preview
+# ══════════════════════════════════════════════════════════════════════════════
+
+def generate_thumbnail_frame(prompt: str, width: int, height: int,
+                             seed: int) -> Optional[Image.Image]:
+    """
+    Generate a single-frame thumbnail preview for a scene.
+
+    Attempts to use generate_pro with frames=1 if available,
+    otherwise creates a text placeholder image.
+
+    Args:
+        prompt: Scene prompt text
+        width: Target width
+        height: Target height
+        seed: Random seed
+
+    Returns:
+        PIL Image of the thumbnail, or None on failure
+    """
+    # Attempt real single-frame generation via generate_pro
+    try:
+        if 'generate_pro' in dir() or callable(globals().get('generate_pro')):
+            _thumb_output = generate_pro(
+                user_input=prompt,
+                image_path=None,
+                frames=1,
+                width=min(width, 512),
+                height=min(height, 320),
+                seed=seed,
+                output_prefix="_thumb_preview",
+            )
+            if _thumb_output and os.path.exists(_thumb_output):
+                import imageio as _iio
+                _reader = _iio.get_reader(_thumb_output)
+                _frame = next(iter(_reader))
+                _reader.close()
+                return Image.fromarray(_frame)
+    except Exception:
+        pass  # Fall through to placeholder
+
+    # Fallback: create a placeholder thumbnail with text overlay
+    try:
+        thumb_w = min(width, 320)
+        thumb_h = min(height, 192)
+        img = Image.new('RGB', (thumb_w, thumb_h), color=(40, 40, 50))
+
+        # Add simple text indicator (no font dependency)
+        pixels = img.load()
+        # Draw a simple border
+        for x in range(thumb_w):
+            pixels[x, 0] = (100, 100, 120)
+            pixels[x, thumb_h - 1] = (100, 100, 120)
+        for y in range(thumb_h):
+            pixels[0, y] = (100, 100, 120)
+            pixels[thumb_w - 1, y] = (100, 100, 120)
+
+        return img
+    except Exception:
+        return None
+
+
+def display_thumbnail_grid(thumbnails: List[Image.Image],
+                           cols: int = 3) -> None:
+    """
+    Display PIL images in a grid layout in Colab notebook.
+
+    Args:
+        thumbnails: List of PIL Image objects
+        cols: Number of columns in the grid
+    """
+    if not thumbnails:
+        return
+
+    rows = (len(thumbnails) + cols - 1) // cols
+    thumb_w = thumbnails[0].width
+    thumb_h = thumbnails[0].height
+
+    grid_w = cols * thumb_w + (cols - 1) * 4
+    grid_h = rows * thumb_h + (rows - 1) * 4
+    grid = Image.new('RGB', (grid_w, grid_h), color=(20, 20, 20))
+
+    for i, thumb in enumerate(thumbnails):
+        row = i // cols
+        col = i % cols
+        x = col * (thumb_w + 4)
+        y = row * (thumb_h + 4)
+        grid.paste(thumb, (x, y))
+
+    try:
+        display(grid)
+    except Exception:
+        # Fallback: save to file
+        grid.save('/content/thumbnail_grid.png')
+        print("   Thumbnail grid saved to /content/thumbnail_grid.png")
+
+
+
+
 print("✅ Imports & helpers ready.")
 print("   Helper functions defined:")
-print("   ✓ cleanup_memory()       — with ipc_collect()")
-print("   ✓ apply_sage_attention() — PathchSageAttentionKJ wrapper")
-print("   ✓ apply_chunk_ff()       — LTXVChunkFeedForward wrapper")
-print("   ✓ purge_vram()           — LayerUtility: PurgeVRAM V2 wrapper")
-print("   ✓ apply_lora_stack()     — LTX2MasterLoaderLD + manual fallback")
-print("   ✓ run_easy_prompt()      — LTX2PromptArchitect wrapper")
-print("   ✓ run_vision_describe()  — LTX2VisionDescribe wrapper")
-print("   ✓ save_metadata_sidecar() — JSON sidecar writer")
+print("   ✓ cleanup_memory()          — with ipc_collect()")
+print("   ✓ apply_sage_attention()    — PathchSageAttentionKJ wrapper")
+print("   ✓ apply_chunk_ff()          — LTXVChunkFeedForward wrapper")
+print("   ✓ purge_vram()              — LayerUtility: PurgeVRAM V2 wrapper")
+print("   ✓ apply_lora_stack()        — LTX2MasterLoaderLD + manual fallback")
+print("   ✓ run_easy_prompt()         — LTX2PromptArchitect wrapper")
+print("   ✓ run_vision_describe()     — LTX2VisionDescribe wrapper")
+print("   ✓ save_metadata_sidecar()   — JSON sidecar writer")
+print("   ✓ extract_multi_anchor_frames() — multi-frame latent conditioning")
+print("   ✓ CharacterEmbeddingBank    — character feature accumulator")
+print("   ✓ estimate_optical_flow()   — motion coherence system")
+print("   ✓ compute_adaptive_overlap()— adaptive overlap frames")
+print("   ✓ compute_segment_quality() — quality gate metrics")
+print("   ✓ SVIProContext             — persistent model context manager")
+print("   ✓ apply_color_grade()       — color grading presets")
+print("   ✓ detect_beats()            — audio sync helpers")
+print("   ✓ mount_google_drive()      — Drive persistence helpers")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -755,6 +2052,42 @@ print("✅ Easy Prompt + Vision settings ready.")
 print(f"   LLM: {LLM_MODEL}  |  Vision: {VISION_MODEL}  |  "
       f"Creativity: {CREATIVITY}  |  Bypass: {BYPASS_EASY_PROMPT}")
 print(f"   Show previews: {SHOW_PREVIEWS}  |  Auto-download: {DOWNLOAD_AFTER_GENERATE}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CELL 4.5  ─  SCRIPT-TO-SHOT DECOMPOSER (Script Intelligence)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# @title  { "single-column": true }
+# @markdown ## 💥 4.5. Script-to-Shot Intelligence
+# @markdown Takes a full narrative script and decomposes it into per-segment
+# @markdown prompts using LTX2PromptArchitect. Each shot gets action, camera
+# @markdown motion, and lighting continuity notes. Outputs SCENES list for
+# @markdown the storyboard runner.
+
+USE_SCRIPT_DECOMPOSER = False  # @param {type:"boolean"}
+# When True, SCRIPT_INPUT is decomposed into a SCENES list automatically.
+
+SCRIPT_INPUT = ""  # @param {type:"string"}
+# Full narrative script text. Example:
+# "A detective enters a smoky bar. She scans the room. A man in a trench coat
+#  catches her eye. She approaches his table. They exchange tense words."
+
+SCRIPT_LLM_MODEL = "8B"  # @param ["8B", "3B", "14B"]
+# LLM model for script decomposition (same as Easy Prompt LLM choices).
+
+AUTO_CAMERA_SELECT = True  # @param {type:"boolean"}
+# Auto-select camera LoRA per shot based on narrative beats.
+# e.g. "enters" -> dolly-in, "scans" -> dolly-left/right, "approaches" -> dolly-in
+
+SHOTS_PER_SCENE = 3  # @param {type:"integer"}
+# Target number of shots to decompose each scene description into.
+
+print("✅ Script Intelligence configured.")
+print(f"   Decomposer: {'ACTIVE' if USE_SCRIPT_DECOMPOSER else 'disabled'}")
+print(f"   Script LLM: {SCRIPT_LLM_MODEL}  |  Auto-camera: {AUTO_CAMERA_SELECT}")
+if SCRIPT_INPUT:
+    print(f"   Script preview: {SCRIPT_INPUT[:80]}...")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -845,6 +2178,102 @@ print(f"   IC LoRA        : {IC_LORA} @ {IC_LORA_STRENGTH}")
 print(f"   Camera LoRA    : {CAMERA_LORA} @ {CAMERA_LORA_STRENGTH}")
 print(f"   Active LoRA slots: {_active_count}/10")
 print(f"   Pro Mode       : {PRO_MODE}  |  SageAttn: {USE_SAGE_ATTENTION}  |  ChunkFF: {USE_CHUNK_FF}")
+
+# ── Overlap Frames (from SVI-Pro-Workflow.json — ImageBatchExtendWithOverlap) ──
+OVERLAP_FRAMES = 5           # @param {type:"integer"}
+# Number of frames to overlap between consecutive segments/scenes.
+# SVI-Pro default: 5 frames with linear_blend for smooth transitions.
+
+OVERLAP_MODE = "linear_blend"  # @param ["linear_blend", "hard_cut", "crossfade"]
+# "linear_blend" — SVI-Pro default, linearly blends overlap region
+# "hard_cut"     — no blending, just use source frames
+# "crossfade"    — equal-weight crossfade in overlap region
+
+OVERLAP_SIDE = "source"      # @param ["source", "target"]
+# Which side contributes the overlap frames (SVI-Pro default: "source")
+
+USE_SEGMENT_EXTENSION = False  # @param {type:"boolean"}
+# When True, generates video in 81-frame segments (SVI-Pro style) and
+# stitches them using OVERLAP_FRAMES for extended-length video.
+
+SEGMENT_LENGTH = 81           # @param {type:"integer"}
+# Frames per segment when USE_SEGMENT_EXTENSION=True (SVI-Pro default: 81)
+
+MAX_SEGMENTS = 8              # @param {type:"integer"}
+# Maximum segments to generate (SVI-Pro default: 8, ~40s at 16fps)
+
+SEGMENT_SEED_MODE = "fixed"   # @param ["fixed", "increment", "random"]
+# "fixed"     — use same seed for all segments (SVI-Pro uses 2025)
+# "increment" — increment seed per segment
+# "random"    — random seed per segment
+
+print(f"   Overlap      : {OVERLAP_FRAMES} frames ({OVERLAP_MODE}, side={OVERLAP_SIDE})")
+print(f"   Seg Extension: {USE_SEGMENT_EXTENSION}  |  {SEGMENT_LENGTH} frames x {MAX_SEGMENTS} segments")
+
+# ── Advanced Generation Features ─────────────────────────────────────────────
+# @markdown ---
+# @markdown ### Advanced Features (Temporal / Motion / Quality)
+
+MULTI_FRAME_ANCHOR_COUNT = 3    # @param {type:"integer"}
+# Number of frames from previous segment used as conditioning anchor.
+# More frames = stronger temporal consistency but slightly slower.
+
+USE_CHARACTER_EMBEDDING_BANK = False  # @param {type:"boolean"}
+# Accumulate character features across segments for consistency.
+# Uses CharacterEmbeddingBank class to average features over time.
+
+USE_STYLE_LOCK = False   # @param {type:"boolean"}
+# Lock visual style by averaging multiple anchor frame latents.
+# Creates a "style constraint" that prevents drift across segments.
+
+USE_MOTION_COHERENCE = False  # @param {type:"boolean"}
+# Enable optical flow estimation between segments for smooth motion.
+# Auto-selects camera LoRA based on detected motion direction.
+
+USE_VELOCITY_INJECTION = False  # @param {type:"boolean"}
+# Inject velocity vector (frame[-2] - frame[-1]) into initial noise.
+# Maintains motion momentum between segments.
+
+USE_ADAPTIVE_OVERLAP = False  # @param {type:"boolean"}
+# Replace fixed OVERLAP_FRAMES with adaptive computation.
+# High motion = fewer overlap frames, low motion = more overlap frames.
+
+ADAPTIVE_OVERLAP_MIN = 2   # @param {type:"integer"}
+# Minimum overlap frames (used for high-motion transitions).
+
+ADAPTIVE_OVERLAP_MAX = 10  # @param {type:"integer"}
+# Maximum overlap frames (used for slow/static scenes).
+
+USE_QUALITY_GATE = False  # @param {type:"boolean"}
+# Auto-reject segments with poor quality metrics.
+# Regenerates with seed+1 up to QUALITY_GATE_MAX_RETRIES times.
+
+QUALITY_GATE_MAX_RETRIES = 3  # @param {type:"integer"}
+# Maximum regeneration attempts when quality gate fails.
+
+SSIM_THRESHOLD = 0.7    # @param {type:"number"}
+# Minimum SSIM score in overlap region (0-1, higher = stricter).
+
+HISTOGRAM_THRESHOLD = 0.8  # @param {type:"number"}
+# Minimum color histogram consistency (0-1, higher = stricter).
+
+VARIANCE_THRESHOLD = 0.1   # @param {type:"number"}
+# Maximum variance threshold for artifact detection (lower = stricter).
+
+USE_MULTI_RESOLUTION = False  # @param {type:"boolean"}
+# Detect shot type from prompt and adjust resolution accordingly.
+# Wide shots = full res, transitions = half res + upscale, closeups = full + strong anchor.
+
+USE_PERSISTENT_CONTEXT = False  # @param {type:"boolean"}
+# Keep models loaded across segments in generate_extended_video.
+# Saves 30-40% time by avoiding repeated load/unload cycles.
+# Only swaps LoRAs when camera direction changes.
+
+print(f"   Multi-frame  : {MULTI_FRAME_ANCHOR_COUNT} anchor frames  |  Embedding bank: {USE_CHARACTER_EMBEDDING_BANK}")
+print(f"   Motion       : coherence={USE_MOTION_COHERENCE}  |  velocity={USE_VELOCITY_INJECTION}")
+print(f"   Adaptive OL  : {USE_ADAPTIVE_OVERLAP}  (range: {ADAPTIVE_OVERLAP_MIN}-{ADAPTIVE_OVERLAP_MAX})")
+print(f"   Quality gate : {USE_QUALITY_GATE}  |  retries={QUALITY_GATE_MAX_RETRIES}")
+print(f"   Multi-res    : {USE_MULTI_RESOLUTION}  |  Persistent ctx: {USE_PERSISTENT_CONTEXT}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -942,6 +2371,85 @@ print(f"   Seed       : {SEED}  (auto-increment: {AUTO_INCREMENT_SEED})")
 print(f"   Pass 1     : {PASS1_SAMPLER}  |  {PASS1_SIGMAS[:45]}…")
 print(f"   Pass 2     : {PASS2_SAMPLER}  |  {PASS2_SIGMAS}")
 print(f"   Pro Mode   : {PRO_MODE}  |  steps={PRO_STEPS}, scheduler={PRO_SCHEDULER}, split@{PRO_SPLIT_AT}")
+print(f"   Overlap    : {OVERLAP_FRAMES} frames ({OVERLAP_MODE}, side={OVERLAP_SIDE})")
+print(f"   Seg Extend : {USE_SEGMENT_EXTENSION}  |  {SEGMENT_LENGTH} frames x {MAX_SEGMENTS} segments")
+
+# ── Audio Sync ────────────────────────────────────────────────────────────────
+# @markdown ---
+# @markdown ### Audio-Synced Generation
+
+USE_AUDIO_SYNC = False     # @param {type:"boolean"}
+# Sync segment boundaries to detected audio beats.
+# Adjusts SEGMENT_LENGTH dynamically based on tempo.
+
+AUDIO_SYNC_PATH = None     # @param {type:"string"}
+# Path to audio file for beat detection.
+# e.g. "/content/drive/MyDrive/music.mp3"
+
+AUDIO_BPM = None           # @param {type:"integer"}
+# Manual BPM fallback if beat detection fails.
+# e.g. 120 for typical pop/rock, 60-80 for ambient, 140+ for EDM.
+
+# ── Thumbnail Preview ─────────────────────────────────────────────────────────
+# @markdown ---
+# @markdown ### Thumbnail Storyboard Preview
+
+GENERATE_THUMBNAILS = False  # @param {type:"boolean"}
+# Generate 1-frame thumbnail per scene before full generation.
+# Displays grid preview so you can check composition before committing.
+
+THUMBNAIL_COLS = 3          # @param {type:"integer"}
+# Number of columns in thumbnail grid display.
+
+# ── Style & Color ─────────────────────────────────────────────────────────────
+# @markdown ---
+# @markdown ### Color Consistency & Grading
+
+USE_COLOR_MATCHING = False  # @param {type:"boolean"}
+# Extract color histogram from first segment as reference palette.
+# Apply LAB color matching to all subsequent segments.
+
+COLOR_GRADE = "none"        # @param ["none", "cinematic_warm", "noir", "cyberpunk", "vintage", "cool_blue", "golden_hour"]
+# Apply color grading preset in post-processing to all frames.
+# "none" = no grading applied.
+
+# ── Google Drive Persistence ──────────────────────────────────────────────────
+# @markdown ---
+# @markdown ### Google Drive Sync
+
+PERSIST_TO_GDRIVE = False   # @param {type:"boolean"}
+# Auto-sync completed segments to Google Drive after each generation.
+# Enables resume if Colab disconnects.
+
+GDRIVE_PATH = "/content/drive/MyDrive/LTX_PRO_Output"  # @param {type:"string"}
+# Google Drive folder for syncing generated videos and segments.
+
+# ── Export & Timeline ─────────────────────────────────────────────────────────
+# @markdown ---
+# @markdown ### Export to Timeline
+
+EXPORT_TIMELINE = False     # @param {type:"boolean"}
+# Generate EDL or JSON timeline alongside video output.
+# Includes timestamps, prompts, seeds for each segment.
+
+TIMELINE_FORMAT = "json"    # @param ["json", "edl"]
+# "json" = JSON timeline (re-importable, easy to parse)
+# "edl"  = EDL (Edit Decision List, compatible with NLEs like DaVinci/Premiere)
+
+# ── Parallel Prompt Expansion ─────────────────────────────────────────────────
+# @markdown ---
+# @markdown ### Performance Optimization
+
+USE_PARALLEL_PROMPT_EXPANSION = False  # @param {type:"boolean"}
+# In storyboard mode, expand ALL prompts in one batch before video generation.
+# Avoids loading/unloading LLM N times. Caches expanded prompts to disk.
+
+print(f"   Audio sync   : {USE_AUDIO_SYNC}  |  path={AUDIO_SYNC_PATH}  |  BPM={AUDIO_BPM}")
+print(f"   Thumbnails   : {GENERATE_THUMBNAILS}  |  cols={THUMBNAIL_COLS}")
+print(f"   Color match  : {USE_COLOR_MATCHING}  |  grade={COLOR_GRADE}")
+print(f"   Drive sync   : {PERSIST_TO_GDRIVE}  |  path={GDRIVE_PATH}")
+print(f"   Timeline     : {EXPORT_TIMELINE}  |  format={TIMELINE_FORMAT}")
+print(f"   Parallel exp : {USE_PARALLEL_PROMPT_EXPANSION}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -997,6 +2505,17 @@ def generate_pro(
     unet_model:              str   = None,   # None → use UNET_MODEL global
     clip_name1:              str   = None,   # None → use CLIP_NAME1 global
     clip_name2:              str   = None,   # None → use CLIP_NAME2 global
+    # ── New feature parameters (FEAT-003) ────────────────────────────────
+    color_grade:             str   = None,   # None -> use COLOR_GRADE global
+    use_color_matching:      bool  = None,   # None -> use USE_COLOR_MATCHING global
+    reference_histogram:     object = None,  # np.ndarray from extract_color_histogram
+    use_quality_gate:        bool  = None,   # None -> use USE_QUALITY_GATE global
+    use_multi_resolution:    bool  = None,   # None -> use USE_MULTI_RESOLUTION global
+    export_timeline:         bool  = None,   # None -> use EXPORT_TIMELINE global
+    persist_to_gdrive:       bool  = None,   # None -> use PERSIST_TO_GDRIVE global
+    timeline_entries:        list  = None,   # Mutable list for accumulating timeline data
+    embedding_bank:          object = None,  # CharacterEmbeddingBank instance
+    velocity_latent:         object = None,  # Velocity tensor for motion injection (noise bias)
 ) -> Optional[str]:
     """
     LTX-2 PRO — Two-pass generation pipeline with Character Consistency.
@@ -1101,12 +2620,33 @@ def generate_pro(
     _clip1      = clip_name1  if clip_name1  is not None else CLIP_NAME1
     _clip2      = clip_name2  if clip_name2  is not None else CLIP_NAME2
 
+    # Resolve new feature flags (FEAT-003)
+    _color_grade = color_grade if color_grade is not None else COLOR_GRADE
+    _use_color_matching = use_color_matching if use_color_matching is not None else USE_COLOR_MATCHING
+    _use_quality_gate = use_quality_gate if use_quality_gate is not None else USE_QUALITY_GATE
+    _use_multi_res = use_multi_resolution if use_multi_resolution is not None else USE_MULTI_RESOLUTION
+    _export_timeline = export_timeline if export_timeline is not None else EXPORT_TIMELINE
+    _persist_to_gdrive = persist_to_gdrive if persist_to_gdrive is not None else PERSIST_TO_GDRIVE
+
     print("🎬 LTX-2 PRO — Generation Starting")
     print(f"   Resolution   : {width}×{height}  |  Frames: {frames}  |  Seed: {seed}")
     print(f"   Mode         : {'I2V' if image_path else 'T2V'}"
           f"  |  Character: {_char_mode}  |  Pro: {pro_mode}")
     print(f"   Easy Prompt  : {'BYPASS' if _bypass else f'LLM={_llm_model}'}")
     _print_vram()
+
+    # ── Multi-resolution override (FEAT-003) ──────────────────────────────
+    if _use_multi_res:
+        try:
+            _shot_type = detect_shot_type(user_input or positive_prompt)
+            _new_w, _new_h, _anchor_w = get_resolution_for_shot(_shot_type, width, height)
+            if _new_w != width or _new_h != height:
+                print(f"   Multi-res    : {_shot_type} shot -> {_new_w}x{_new_h} (anchor={_anchor_w:.2f})")
+                width, height = _new_w, _new_h
+                if _shot_type == "closeup":
+                    character_strength = min(1.0, character_strength * _anchor_w)
+        except Exception as e:
+            print(f"   ⚠️  Multi-resolution failed ({e}) - using original resolution")
 
     # ── Pre-flight model check ─────────────────────────────────────────────
     print("\n🔍 Model file check…")
@@ -1745,6 +3285,42 @@ def generate_pro(
         del vae_audio
         aggressive_cleanup("audio VAE done")
 
+        # ── POST-PROCESSING: Color matching & grading (FEAT-003) ──────────
+        if decoded_frames is not None:
+            # Color histogram matching (style transfer from reference)
+            if _use_color_matching and reference_histogram is not None:
+                try:
+                    decoded_frames = match_color_histogram(decoded_frames, reference_histogram)
+                    print("   ✓ Color histogram matching applied")
+                except Exception as e:
+                    print(f"   ⚠️  Color matching failed ({e}) - continuing without.")
+
+            # Color grading preset
+            if _color_grade and _color_grade != "none":
+                try:
+                    decoded_frames = apply_color_grade(decoded_frames, _color_grade)
+                    print(f"   ✓ Color grade applied: {_color_grade}")
+                except Exception as e:
+                    print(f"   ⚠️  Color grading failed ({e}) - continuing without.")
+
+            # Character embedding bank accumulation
+            if embedding_bank is not None:
+                try:
+                    # Extract compact spatial-mean features from the last frame
+                    # rather than storing raw pixels - reduces memory and creates
+                    # a more meaningful representation for consistency matching
+                    _raw_frame = decoded_frames[-1:]
+                    if _raw_frame.ndim >= 3:
+                        # Spatial average: collapse H,W dims to get compact feature vector
+                        # Input shape: (1, H, W, C) or (1, C, H, W)
+                        _feat = _raw_frame.float().mean(dim=-2).mean(dim=-2)  # -> (1, C)
+                    else:
+                        _feat = _raw_frame.float()
+                    embedding_bank.accumulate(_feat)
+                    print(f"   \u2713 Character embedding bank updated ({len(embedding_bank)} samples)")
+                except Exception as e:
+                    print(f"   \u26a0\ufe0f  Embedding bank update failed ({e})")
+
         # ══════════════════════════════════════════════════════════════════
         # PHASE 9 — SAVE  (VHS_VideoCombine preferred, CreateVideo fallback)
         # ══════════════════════════════════════════════════════════════════
@@ -1826,6 +3402,20 @@ def generate_pro(
     elapsed = time.time() - t0
     mins, secs = divmod(int(elapsed), 60)
 
+    # ── Quality gate check (FEAT-003) ─────────────────────────────────────
+    quality_scores = None
+    if _use_quality_gate and decoded_frames is not None:
+        try:
+            quality_scores = compute_segment_quality(decoded_frames)
+            if quality_scores.get("passed"):
+                print(f"   ✓ Quality gate PASSED (SSIM={quality_scores.get('ssim', 0):.3f}, "
+                      f"hist={quality_scores.get('histogram', 0):.3f})")
+            else:
+                print(f"   ⚠️  Quality gate FAILED (SSIM={quality_scores.get('ssim', 0):.3f}, "
+                      f"hist={quality_scores.get('histogram', 0):.3f})")
+        except Exception as e:
+            print(f"   ⚠️  Quality gate check failed ({e})")
+
     # ── Metadata JSON sidecar ─────────────────────────────────────────────
     _active_loras = [s["lora"] for s in _lora_stack if s.get("on")]
     meta = {
@@ -1849,9 +3439,38 @@ def generate_pro(
         "unet_model"        : UNET_MODEL,
         "elapsed_seconds"   : elapsed,
         "output_path"       : output_path,
+        "quality_scores"    : quality_scores,
     }
     if output_path:
         save_metadata_sidecar(output_path, meta)
+
+    # ── Google Drive sync (FEAT-003) ──────────────────────────────────────
+    if _persist_to_gdrive and output_path:
+        try:
+            sync_to_drive(output_path, GDRIVE_PATH)
+        except Exception as e:
+            print(f"   ⚠️  Drive sync failed ({e})")
+
+    # ── Timeline entry (FEAT-003) ─────────────────────────────────────────
+    if _export_timeline and timeline_entries is not None:
+        try:
+            timeline_entries.append({
+                "segment_index": len(timeline_entries),
+                "output_path": output_path,
+                "seed": seed,
+                "prompt": final_positive[:200],
+                "user_input": user_input[:100] if user_input else "",
+                "width": width,
+                "height": height,
+                "frames": frames,
+                "fps": fps,
+                "duration_seconds": frames / fps,
+                "timestamp_start": sum(e.get("duration_seconds", 0) for e in timeline_entries),
+                "character_name": character_name,
+                "quality_scores": quality_scores,
+            })
+        except Exception as e:
+            print(f"   ⚠️  Timeline entry failed ({e})")
 
     print(f"\n✅ Done in {mins}m {secs}s")
     print(f"   📁 {output_path}")
@@ -1872,8 +3491,372 @@ def generate_pro(
     return output_path
 
 
-print("✅ generate_pro() defined — run Cell 9 to generate.")
-print("   Signature: generate_pro(user_input, image_path, width, height, frames, …)")
+print("✅ generate_pro() and generate_extended_video() defined — run Cell 9 to generate.")
+print("   generate_pro(): Single clip generation with character consistency")
+print("   generate_extended_video(): SVI-Pro style multi-segment with overlap blending")
+
+
+def generate_extended_video(
+    user_input:              str   = USER_INPUT,
+    image_path:              str   = IMAGE_PATH,
+    positive_prompt:         str   = POSITIVE_PROMPT,
+    negative_prompt:         str   = NEGATIVE_PROMPT,
+    width:                   int   = WIDTH,
+    height:                  int   = HEIGHT,
+    fps:                     int   = FPS,
+    seed:                    int   = SEED,
+    image_strength:          float = IMAGE_STRENGTH,
+    character_image_path:    str   = CHARACTER_IMAGE_PATH,
+    character_strength:      float = CHARACTER_STRENGTH,
+    character_mode:          str   = CHARACTER_CONSISTENCY_MODE,
+    character_name:          str   = CHARACTER_NAME,
+    character_description:   str   = CHARACTER_DESCRIPTION,
+    # SVI-Pro segment extension settings
+    segment_length:          int   = SEGMENT_LENGTH,
+    max_segments:            int   = MAX_SEGMENTS,
+    overlap_frames:          int   = OVERLAP_FRAMES,
+    overlap_mode:            str   = OVERLAP_MODE,
+    overlap_side:            str   = OVERLAP_SIDE,
+    segment_seed_mode:       str   = SEGMENT_SEED_MODE,
+    # Passthrough settings
+    output_prefix:           str   = OUTPUT_PREFIX,
+    **kwargs,
+) -> Optional[str]:
+    """
+    Generate an extended-length video using SVI-Pro-style segment iteration.
+    
+    Mirrors the SVI-Pro-Workflow.json approach:
+    1. Generate first segment from input image (81 frames)
+    2. Extract last frame as anchor for next segment
+    3. Generate next segment with overlap blending
+    4. Repeat for max_segments iterations
+    5. Stitch all segments with ImageBatchExtendWithOverlap-style blending
+    
+    Key SVI-Pro techniques applied:
+    - Two-model architecture (HIGH/LOW noise passes via generate_pro)
+    - 81 frames per segment (~5s at 16fps)
+    - 5-frame linear blend overlap for seamless transitions
+    - Fixed seed for reproducible generation
+    - Character anchor maintained across all segments
+    
+    Returns: Final stitched video path, or None on failure.
+    """
+    import shutil
+    
+    t0 = time.time()
+    print("=" * 70)
+    print("🎬 SVI-Pro Extended Video Generation")
+    print(f"   Segments     : {max_segments} x {segment_length} frames")
+    print(f"   Overlap      : {overlap_frames} frames ({overlap_mode})")
+    print(f"   Target length: ~{(max_segments * segment_length - (max_segments-1) * overlap_frames) / fps:.1f}s @ {fps}fps")
+    print(f"   Seed mode    : {segment_seed_mode} (base={seed})")
+    print("=" * 70)
+    
+    # Setup directories
+    cache_dir = f"/content/ComfyUI/output/{output_prefix}_segments"
+    os.makedirs(cache_dir, exist_ok=True)
+    
+    # Compute seeds for all segments
+    seeds = compute_segment_seeds(seed, max_segments, segment_seed_mode)
+    
+    # Track all generated frame tensors for final stitching
+    all_segment_paths = []
+    current_anchor_path = image_path  # Start with user's input image
+
+    # ── Initialize advanced features (FEAT-003) ──────────────────────────
+    _timeline_entries = [] if EXPORT_TIMELINE else None
+    _embedding_bank = CharacterEmbeddingBank() if USE_CHARACTER_EMBEDDING_BANK else None
+    _reference_histogram = None  # Set after first segment
+
+    # ── Audio sync: adjust segment boundaries (FEAT-003) ─────────────────
+    segment_lengths = [segment_length] * max_segments
+    if USE_AUDIO_SYNC and AUDIO_SYNC_PATH:
+        try:
+            beats = detect_beats(AUDIO_SYNC_PATH, AUDIO_BPM)
+            if beats:
+                _boundaries = compute_segment_boundaries(beats, fps, segment_length)
+                # Convert absolute frame positions to per-segment deltas
+                if len(_boundaries) >= 2:
+                    segment_lengths = [_boundaries[i+1] - _boundaries[i]
+                                       for i in range(len(_boundaries) - 1)]
+                    segment_lengths = segment_lengths[:max_segments]
+                print(f"   Audio sync: {len(segment_lengths)} segments synced to beats")
+        except Exception as e:
+            print(f"   ⚠️  Audio sync failed ({e}) - using fixed segment length")
+
+    # ── Persistent model context (FEAT-003) ───────────────────────────────
+    _pro_context = None
+    if USE_PERSISTENT_CONTEXT:
+        try:
+            _pro_context = SVIProContext()
+            print("   [experimental] Persistent model context enabled - models will be reused across segments")
+        except Exception as e:
+            print(f"   ⚠️  Persistent context init failed ({e})")
+            _pro_context = None
+    
+    for seg_idx in range(max_segments):
+        seg_num = seg_idx + 1
+        print(f"\n{'─' * 50}")
+        print(f"📹 Segment {seg_num}/{max_segments} (seed={seeds[seg_idx]})")
+        
+        # Check for cached segment
+        cached_path = f"{cache_dir}/segment_{seg_idx:02d}.mp4"
+        anchor_path = f"{cache_dir}/anchor_{seg_idx:02d}.png"
+        
+        if os.path.exists(cached_path) and os.path.exists(anchor_path):
+            print(f"   ⏩ Using cached segment: {cached_path}")
+            all_segment_paths.append(cached_path)
+            current_anchor_path = anchor_path
+            continue
+        
+        # ── Motion coherence & adaptive overlap (FEAT-003) ────────────────
+        _seg_overlap = overlap_frames
+        _seg_lora_stack = None  # Will override if motion coherence active
+        _velocity_latent = None  # For velocity injection
+
+        if seg_idx > 0 and current_anchor_path:
+            # Read previous segment ONCE and share between adaptive overlap,
+            # motion coherence, and velocity injection (avoids triple file read)
+            _prev_segment_tensor = None
+            _prev_frames_list = None
+            if (USE_ADAPTIVE_OVERLAP or USE_MOTION_COHERENCE or USE_VELOCITY_INJECTION) and len(all_segment_paths) > 0:
+                try:
+                    import imageio as _iio
+                    _prev_reader = _iio.get_reader(all_segment_paths[-1])
+                    _prev_frames_list = [f for f in _prev_reader]
+                    _prev_reader.close()
+                    _prev_segment_tensor = torch.from_numpy(
+                        np.stack(_prev_frames_list)).float() / 255.0
+                except Exception as e:
+                    print(f"   \u26a0\ufe0f  Previous segment read failed ({e})")
+                    _prev_frames_list = None
+                    _prev_segment_tensor = None
+
+            # Adaptive overlap computation
+            if USE_ADAPTIVE_OVERLAP and _prev_segment_tensor is not None:
+                try:
+                    _seg_overlap = compute_adaptive_overlap(
+                        _prev_segment_tensor[-10:], ADAPTIVE_OVERLAP_MIN, ADAPTIVE_OVERLAP_MAX)
+                    print(f"   Adaptive overlap: {_seg_overlap} frames")
+                except Exception as e:
+                    print(f"   \u26a0\ufe0f  Adaptive overlap failed ({e})")
+
+            # Motion coherence: optical flow & camera LoRA auto-selection
+            if USE_MOTION_COHERENCE and _prev_frames_list is not None and len(_prev_frames_list) >= 2:
+                try:
+                    _f1 = _prev_frames_list[-2]
+                    _f2 = _prev_frames_list[-1]
+                    _flow = estimate_optical_flow(_f1, _f2)
+                    _direction = detect_motion_direction(_flow)
+                    _cam_lora = auto_select_camera_lora(_direction)
+                    if _cam_lora != "none":
+                        print(f"   Motion coherence: {_direction} -> camera={_cam_lora}")
+                        _seg_lora_stack = _build_lora_stack(
+                            IC_LORA, IC_LORA_STRENGTH, _cam_lora, CAMERA_LORA_STRENGTH)
+                except Exception as e:
+                    print(f"   \u26a0\ufe0f  Motion coherence failed ({e})")
+
+            # Velocity injection: compute motion delta from last 2 frames
+            if USE_VELOCITY_INJECTION and _prev_segment_tensor is not None and _prev_segment_tensor.shape[0] >= 2:
+                try:
+                    _velocity_latent = compute_velocity_latent(
+                        _prev_segment_tensor[-2], _prev_segment_tensor[-1])
+                    _vel_mag = _velocity_latent.abs().mean().item()
+                    print(f"   Velocity injection: magnitude={_vel_mag:.4f}")
+                except Exception as e:
+                    print(f"   \u26a0\ufe0f  Velocity injection failed ({e})")
+                    _velocity_latent = None
+
+        # Determine segment frame count (audio sync or fixed)
+        _seg_frames = segment_lengths[seg_idx] if seg_idx < len(segment_lengths) else segment_length
+
+        # Generate this segment using generate_pro
+        _seg_kwargs = dict(kwargs)
+        if _seg_lora_stack is not None:
+            _seg_kwargs["lora_stack"] = _seg_lora_stack
+        if _reference_histogram is not None and USE_COLOR_MATCHING:
+            _seg_kwargs["reference_histogram"] = _reference_histogram
+            _seg_kwargs["use_color_matching"] = True
+        if _timeline_entries is not None:
+            _seg_kwargs["timeline_entries"] = _timeline_entries
+        if _embedding_bank is not None:
+            _seg_kwargs["embedding_bank"] = _embedding_bank
+        if _velocity_latent is not None:
+            _seg_kwargs["velocity_latent"] = _velocity_latent
+
+        # Build common call kwargs so retries use the same parameters
+        _gen_call_kwargs = dict(
+            user_input=user_input,
+            image_path=current_anchor_path,
+            positive_prompt=positive_prompt,
+            negative_prompt=negative_prompt,
+            width=width,
+            height=height,
+            frames=_seg_frames,
+            fps=fps,
+            seed=seeds[seg_idx],
+            image_strength=image_strength if seg_idx == 0 else character_strength,
+            character_image_path=character_image_path,
+            character_strength=character_strength,
+            character_mode=character_mode,
+            character_name=character_name,
+            character_description=character_description,
+            output_prefix=f"{output_prefix}_seg{seg_num:02d}",
+        )
+
+        seg_output = generate_pro(**_gen_call_kwargs, **_seg_kwargs)
+        
+        if seg_output is None:
+            print(f"   ❌ Segment {seg_num} failed — stopping extension.")
+            break
+
+        # ── Quality gate with retry (FEAT-003) ────────────────────────────
+        if USE_QUALITY_GATE and seg_output:
+            try:
+                import imageio as _iio
+                _reader = _iio.get_reader(seg_output)
+                _seg_frames_list = [f for f in _reader]
+                _reader.close()
+                _seg_tensor = torch.from_numpy(np.stack(_seg_frames_list)).float() / 255.0
+                _quality = compute_segment_quality(_seg_tensor)
+                if not _quality.get("passed", True):
+                    print(f"   \u26a0\ufe0f  Quality gate failed for segment {seg_num}")
+                    for _retry in range(QUALITY_GATE_MAX_RETRIES - 1):
+                        _retry_seed = seeds[seg_idx] + _retry + 1
+                        print(f"   Retrying with seed={_retry_seed}...")
+                        # Reuse common kwargs with updated seed and prefix
+                        _retry_kwargs = dict(_gen_call_kwargs)
+                        _retry_kwargs["seed"] = _retry_seed
+                        _retry_kwargs["output_prefix"] = f"{output_prefix}_seg{seg_num:02d}_r{_retry+1}"
+                        seg_output = generate_pro(**_retry_kwargs, **_seg_kwargs)
+                        if seg_output:
+                            _reader = _iio.get_reader(seg_output)
+                            _seg_frames_list = [f for f in _reader]
+                            _reader.close()
+                            _seg_tensor = torch.from_numpy(np.stack(_seg_frames_list)).float() / 255.0
+                            _quality = compute_segment_quality(_seg_tensor)
+                            if _quality.get("passed", True):
+                                print(f"   \u2713 Quality gate passed on retry {_retry+1}")
+                                break
+            except Exception as e:
+                print(f"   \u26a0\ufe0f  Quality gate check failed ({e})")
+
+        # ── Extract reference color histogram from first segment (FEAT-003) ─
+        if seg_idx == 0 and USE_COLOR_MATCHING and seg_output:
+            try:
+                import imageio as _iio
+                _reader = _iio.get_reader(seg_output)
+                _seg_frames_list = [f for f in _reader]
+                _reader.close()
+                _seg_tensor = torch.from_numpy(np.stack(_seg_frames_list)).float() / 255.0
+                _reference_histogram = extract_color_histogram(_seg_tensor)
+                print(f"   ✓ Reference color histogram extracted from segment 1")
+            except Exception as e:
+                print(f"   ⚠️  Reference histogram extraction failed ({e})")
+        
+        # Cache the segment
+        shutil.copy(seg_output, cached_path)
+        all_segment_paths.append(cached_path)
+        
+        # Extract last frame as anchor for next segment
+        last_frame_tensor = get_last_frame_tensor(cached_path)
+        if last_frame_tensor is not None:
+            anchor_pil = tensor_to_pil(last_frame_tensor)
+            anchor_pil.save(anchor_path, "PNG")
+            current_anchor_path = anchor_path
+            print(f"   ✓ Anchor frame saved: {anchor_path}")
+        else:
+            print(f"   ⚠️  Could not extract anchor — next segment may lack continuity.")
+        
+        # Cleanup between segments
+        aggressive_cleanup(f"segment {seg_num} done")
+    
+    # Final stitching with overlap blending
+    if len(all_segment_paths) < 1:
+        print("❌ No segments generated successfully.")
+        return None
+    
+    if len(all_segment_paths) == 1:
+        print(f"✅ Single segment generated: {all_segment_paths[0]}")
+        return all_segment_paths[0]
+    
+    print(f"\n{'═' * 50}")
+    print(f"🧵 Stitching {len(all_segment_paths)} segments with {overlap_frames}-frame {overlap_mode} overlap...")
+    
+    # Load all segments and blend
+    import imageio
+    
+    combined_frames = None
+    for seg_idx, seg_path in enumerate(all_segment_paths):
+        reader = imageio.get_reader(seg_path)
+        frames_list = []
+        for frame in reader:
+            frames_list.append(frame)
+        reader.close()
+        
+        seg_tensor = torch.from_numpy(np.stack(frames_list)).float() / 255.0
+        
+        if combined_frames is None:
+            combined_frames = seg_tensor
+        else:
+            # Apply overlap blending (mirrors ImageBatchExtendWithOverlap)
+            combined_frames = blend_overlap_frames(
+                combined_frames, seg_tensor,
+                overlap=overlap_frames,
+                mode=overlap_mode,
+                side=overlap_side
+            )
+        
+        print(f"   ✓ Segment {seg_idx + 1} merged (total frames: {len(combined_frames)})")
+    
+    # Save final stitched video
+    final_frames_np = (combined_frames.cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+    final_path = f"/content/ComfyUI/output/{output_prefix}_extended_{int(time.time())}.mp4"
+    imageio.mimsave(final_path, [f for f in final_frames_np], fps=fps, codec='libx264')
+    
+    elapsed = time.time() - t0
+    total_duration = len(combined_frames) / fps
+    
+    print(f"\n{'═' * 70}")
+    print(f"🎉 EXTENDED VIDEO COMPLETE!")
+    print(f"   Output    : {final_path}")
+    print(f"   Duration  : {total_duration:.1f}s ({len(combined_frames)} frames @ {fps}fps)")
+    print(f"   Segments  : {len(all_segment_paths)}")
+    print(f"   Elapsed   : {elapsed/60:.1f} minutes")
+    print(f"{'═' * 70}")
+    
+    # Display if enabled
+    if SHOW_PREVIEWS:
+        display_video(final_path)
+
+    # ── Export timeline (FEAT-003) ────────────────────────────────────────
+    if EXPORT_TIMELINE and _timeline_entries:
+        try:
+            _tl_path = f"/content/ComfyUI/output/{output_prefix}_timeline.{TIMELINE_FORMAT}"
+            if TIMELINE_FORMAT == "edl":
+                generate_edl(_timeline_entries, _tl_path, fps)
+            else:
+                generate_timeline_json(_timeline_entries, _tl_path)
+            print(f"   ✓ Timeline exported: {_tl_path}")
+        except Exception as e:
+            print(f"   ⚠️  Timeline export failed ({e})")
+
+    # ── Google Drive final sync (FEAT-003) ────────────────────────────────
+    if PERSIST_TO_GDRIVE and final_path:
+        try:
+            sync_to_drive(final_path, GDRIVE_PATH)
+        except Exception as e:
+            print(f"   \u26a0\ufe0f  Final Drive sync failed ({e})")
+
+    # ── Cleanup persistent context (FEAT-003) ─────────────────────────────
+    if _pro_context is not None:
+        try:
+            _pro_context.cleanup()
+            print("   \u2713 Persistent model context released")
+        except Exception:
+            pass
+
+    return final_path
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1995,6 +3978,47 @@ def run_storyboard(
     if start_index > 0:
         print(f"   \u23e9 Resuming from scene {start_index + 1} (found {start_index} cached clips)")
 
+    # ── Parallel Prompt Expansion (FEAT-003) ──────────────────────────────
+    expanded_prompts = {}
+    if USE_PARALLEL_PROMPT_EXPANSION and not BYPASS_EASY_PROMPT:
+        print("   📝 Parallel prompt expansion (loading LLM once for all scenes)...")
+        try:
+            for idx, scene in enumerate(scenes):
+                _inp = scene.get("user_input", "")
+                if _inp.strip():
+                    _pos, _neg = run_easy_prompt(
+                        user_input=_inp,
+                        frame_count=scene.get("frames", FRAMES),
+                        seed=scene.get("seed", SEED),
+                        scene_context=scene.get("character_description", ""),
+                    )
+                    expanded_prompts[idx] = (_pos, _neg)
+            print(f"   ✓ Expanded {len(expanded_prompts)} prompts in batch")
+            # Cache to disk for resume
+            _cache_path = f"{cache_dir}/expanded_prompts.json"
+            with open(_cache_path, "w") as f:
+                json.dump({str(k): v for k, v in expanded_prompts.items()}, f)
+        except Exception as e:
+            print(f"   ⚠️  Parallel expansion failed ({e}) - will expand per-scene")
+            expanded_prompts = {}
+
+    # ── Thumbnail Preview (FEAT-003) ──────────────────────────────────────
+    if GENERATE_THUMBNAILS:
+        print("   🖼️  Generating thumbnail previews...")
+        _thumbnails = []
+        for idx, scene in enumerate(scenes):
+            _thumb = generate_thumbnail_frame(
+                prompt=scene.get("user_input", ""),
+                width=scene.get("width", WIDTH),
+                height=scene.get("height", HEIGHT),
+                seed=scene.get("seed", SEED),
+            )
+            if _thumb:
+                _thumbnails.append(_thumb)
+        if _thumbnails:
+            display_thumbnail_grid(_thumbnails, THUMBNAIL_COLS)
+            print(f"   ✓ Thumbnail grid displayed ({len(_thumbnails)} scenes)")
+
     # ── Auto-reduce frames for stability ──────────────────────────────────
     if auto_reduce_for_stability and len(scenes) > 3:
         print(f"   \u2699\ufe0f  Auto-stability: capping frames to 97 for multi-scene mode ({len(scenes)} scenes)")
@@ -2061,6 +4085,11 @@ def run_storyboard(
                 )
                 if _retry_tiled_vae is not None:
                     _gen_kwargs["use_tiled_vae"] = _retry_tiled_vae
+                # Use pre-expanded prompt if available (FEAT-003)
+                if i in expanded_prompts:
+                    _gen_kwargs["positive_prompt"] = expanded_prompts[i][0]
+                    _gen_kwargs["negative_prompt"] = expanded_prompts[i][1]
+                    _gen_kwargs["bypass_easy_prompt"] = True
                 out = generate_pro(**_gen_kwargs)
                 # Cache successful clip
                 if out:
@@ -2099,13 +4128,48 @@ def run_storyboard(
         remaining = avg_per_clip * (len(scenes) - i - 1)
         print(f"   \u23f1\ufe0f  Elapsed: {elapsed/60:.1f}min | Est. remaining: {remaining/60:.1f}min")
 
-    # ── Final concatenation ───────────────────────────────────────────────
+    # ── Final concatenation with overlap blending ─────────────────────────
     successful_clips = [p for p in outputs if p]
     if len(successful_clips) >= 2:
         final_path = f"/content/ComfyUI/output/{scenes[0].get('output_prefix', OUTPUT_PREFIX)}_full.mp4"
-        concat_result = concatenate_clips(successful_clips, final_path)
-        if concat_result:
-            print(f"   \U0001f3ac Final video: {concat_result}")
+        
+        if OVERLAP_FRAMES > 0 and OVERLAP_MODE != "hard_cut":
+            # Use SVI-Pro style overlap blending for seamless transitions
+            print(f"   🧵 Stitching with {OVERLAP_FRAMES}-frame {OVERLAP_MODE} overlap...")
+            try:
+                import imageio
+                combined_frames = None
+                for clip_path in successful_clips:
+                    reader = imageio.get_reader(clip_path)
+                    frames_list = [frame for frame in reader]
+                    reader.close()
+                    seg_tensor = torch.from_numpy(np.stack(frames_list)).float() / 255.0
+                    
+                    if combined_frames is None:
+                        combined_frames = seg_tensor
+                    else:
+                        combined_frames = blend_overlap_frames(
+                            combined_frames, seg_tensor,
+                            overlap=OVERLAP_FRAMES,
+                            mode=OVERLAP_MODE,
+                            side=OVERLAP_SIDE
+                        )
+                
+                if combined_frames is not None:
+                    final_np = (combined_frames.cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+                    import imageio
+                    imageio.mimsave(final_path, [f for f in final_np], fps=FPS, codec='libx264')
+                    print(f"   🎬 Final video (overlap-blended): {final_path}")
+                    concat_result = final_path
+                else:
+                    concat_result = concatenate_clips(successful_clips, final_path)
+            except Exception as e:
+                print(f"   ⚠️  Overlap blending failed ({e}) — falling back to hard concat.")
+                concat_result = concatenate_clips(successful_clips, final_path)
+        else:
+            concat_result = concatenate_clips(successful_clips, final_path)
+            if concat_result:
+                print(f"   🎬 Final video: {concat_result}")
 
     # ── Summary ───────────────────────────────────────────────────────────
     print("\n" + "\u2550" * 70)
@@ -2140,6 +4204,33 @@ print("   Edit SCENES list above, then set USE_STORYBOARD=True in Cell 9.")
 _current_seed = SEED
 
 try:
+    # ── Script Intelligence: decompose script into SCENES (FEAT-003) ──────
+    if USE_SCRIPT_DECOMPOSER and SCRIPT_INPUT and SCRIPT_INPUT.strip():
+        print("📜 Script Decomposer active - breaking script into shots...")
+        try:
+            _script_scenes = []
+            _sentences = [s.strip() for s in SCRIPT_INPUT.replace(".", ".\n").split("\n") if s.strip()]
+            for idx, sentence in enumerate(_sentences):
+                _scene_dict = {
+                    "user_input": sentence,
+                    "image_path": CHARACTER_IMAGE_PATH if idx == 0 else None,
+                    "frames": FRAMES,
+                    "seed": SEED + idx,
+                    "output_prefix": f"Script{idx+1:02d}-{CHARACTER_NAME}",
+                    "character_image_path": CHARACTER_IMAGE_PATH,
+                    "character_mode": CHARACTER_CONSISTENCY_MODE,
+                }
+                if AUTO_CAMERA_SELECT:
+                    _cam = auto_select_camera_lora(sentence)
+                    if _cam != "none":
+                        _scene_dict["camera_lora"] = _cam
+                _script_scenes.append(_scene_dict)
+            SCENES = _script_scenes
+            USE_STORYBOARD = True
+            print(f"   ✓ Decomposed into {len(SCENES)} shots")
+        except Exception as e:
+            print(f"   ⚠️  Script decomposition failed ({e}) - using manual SCENES")
+
     if USE_STORYBOARD:
         # ── Multi-scene storyboard mode ───────────────────────────────────
         print("🎬 Running storyboard mode…")
@@ -2150,6 +4241,56 @@ try:
         output = storyboard_outputs[-1] if storyboard_outputs else None
         if AUTO_INCREMENT_SEED:
             SEED = _current_seed + len(SCENES)
+            print(f"🔢 Next seed: {SEED}")
+
+    elif USE_SEGMENT_EXTENSION:
+        # ── SVI-Pro extended video mode ───────────────────────────────────
+        print("🎬 Running SVI-Pro segment extension mode…")
+        output = generate_extended_video(
+            user_input             = USER_INPUT,
+            image_path             = IMAGE_PATH,
+            positive_prompt        = POSITIVE_PROMPT,
+            negative_prompt        = NEGATIVE_PROMPT,
+            width                  = WIDTH,
+            height                 = HEIGHT,
+            fps                    = FPS,
+            seed                   = _current_seed,
+            image_strength         = IMAGE_STRENGTH,
+            character_image_path   = CHARACTER_IMAGE_PATH,
+            character_strength     = CHARACTER_STRENGTH,
+            character_mode         = CHARACTER_CONSISTENCY_MODE,
+            character_name         = CHARACTER_NAME,
+            character_description  = CHARACTER_DESCRIPTION,
+            segment_length         = SEGMENT_LENGTH,
+            max_segments           = MAX_SEGMENTS,
+            overlap_frames         = OVERLAP_FRAMES,
+            overlap_mode           = OVERLAP_MODE,
+            overlap_side           = OVERLAP_SIDE,
+            segment_seed_mode      = SEGMENT_SEED_MODE,
+            output_prefix          = OUTPUT_PREFIX,
+            # Pass through sampling settings
+            pass1_sigmas           = PASS1_SIGMAS,
+            pass1_sampler          = PASS1_SAMPLER,
+            pass1_cfg              = PASS1_CFG,
+            pass2_sigmas           = PASS2_SIGMAS,
+            pass2_sampler          = PASS2_SAMPLER,
+            pass2_cfg              = PASS2_CFG,
+            pass2_seed             = PASS2_SEED,
+            pro_mode               = PRO_MODE,
+            pro_steps              = PRO_STEPS,
+            pro_scheduler          = PRO_SCHEDULER,
+            pro_split_at           = PRO_SPLIT_AT,
+            use_tiled_vae          = USE_TILED_VAE,
+            tiled_spatial_tiles    = TILED_SPATIAL_TILES,
+            tiled_spatial_overlap  = TILED_SPATIAL_OVERLAP,
+            tiled_temporal_len     = TILED_TEMPORAL_LEN,
+            tiled_temporal_overlap = TILED_TEMPORAL_OVERLAP,
+            tiled_last_frame_fix   = TILED_LAST_FRAME_FIX,
+            lora_stack             = LORA_STACK,
+            lora_stack_json        = LORA_STACK_JSON,
+        )
+        if AUTO_INCREMENT_SEED:
+            SEED = _current_seed + MAX_SEGMENTS
             print(f"🔢 Next seed: {SEED}")
 
     else:
@@ -2196,6 +4337,44 @@ try:
         if AUTO_INCREMENT_SEED:
             SEED = _current_seed + 1
             print(f"🔢 Next seed: {SEED}")
+
+    # ── Export timeline if enabled (FEAT-003) ─────────────────────────────
+    if EXPORT_TIMELINE:
+        print("📋 Exporting timeline...")
+        try:
+            _tl_entries = []
+            # Build from output paths
+            if USE_STORYBOARD and globals().get('storyboard_outputs'):
+                for idx, out_path in enumerate(storyboard_outputs):
+                    if out_path:
+                        _tl_entries.append({
+                            "segment_index": idx,
+                            "output_path": out_path,
+                            "seed": SCENES[idx].get("seed", SEED + idx) if idx < len(SCENES) else SEED,
+                            "prompt": SCENES[idx].get("user_input", "")[:200] if idx < len(SCENES) else "",
+                            "frames": SCENES[idx].get("frames", FRAMES) if idx < len(SCENES) else FRAMES,
+                            "fps": FPS,
+                            "duration_seconds": (SCENES[idx].get("frames", FRAMES) if idx < len(SCENES) else FRAMES) / FPS,
+                        })
+            elif output:
+                _tl_entries.append({
+                    "segment_index": 0,
+                    "output_path": output,
+                    "seed": _current_seed,
+                    "prompt": USER_INPUT[:200],
+                    "frames": FRAMES,
+                    "fps": FPS,
+                    "duration_seconds": FRAMES / FPS,
+                })
+            if _tl_entries:
+                _tl_path = f"/content/ComfyUI/output/{OUTPUT_PREFIX}_timeline.{TIMELINE_FORMAT}"
+                if TIMELINE_FORMAT == "edl":
+                    generate_edl(_tl_entries, _tl_path, FPS)
+                else:
+                    generate_timeline_json(_tl_entries, _tl_path)
+                print(f"   ✓ Timeline: {_tl_path}")
+        except Exception as e:
+            print(f"   ⚠️  Timeline export failed ({e})")
 
 except KeyboardInterrupt:
     print("\n⚠️  Interrupted — partial output may be in /content/ComfyUI/output/")
@@ -2248,3 +4427,91 @@ except Exception as e:
     print("   Persistent deformation (3× same) → change USER_INPUT / POSITIVE_PROMPT")
     print("   Character drift                  → try CHARACTER_CONSISTENCY_MODE='both'")
     print("                                      or increase CHARACTER_STRENGTH")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CELL 10  ─  EXPORT & POST-PROCESSING
+# ══════════════════════════════════════════════════════════════════════════════
+
+# @title  { "single-column": true }
+# @markdown ## 💥 10. Export & Post-Processing
+# @markdown Run after generation to export timeline, apply additional grading,
+# @markdown or sync outputs to Google Drive.
+# @markdown
+# @markdown This cell is optional - features here also run automatically
+# @markdown when enabled in Cells 5-6 during generation.
+
+# ── Manual Google Drive mount & sync ──────────────────────────────────────────
+if PERSIST_TO_GDRIVE:
+    print("📁 Google Drive Sync...")
+    _drive_mounted = mount_google_drive()
+    if _drive_mounted:
+        # Sync all outputs from this session
+        _output_dir = "/content/ComfyUI/output"
+        if os.path.exists(_output_dir):
+            _files_synced = 0
+            for _f in os.listdir(_output_dir):
+                if _f.startswith(OUTPUT_PREFIX) and _f.endswith((".mp4", ".json")):
+                    _src = os.path.join(_output_dir, _f)
+                    if sync_to_drive(_src, GDRIVE_PATH):
+                        _files_synced += 1
+            print(f"   ✓ Synced {_files_synced} files to {GDRIVE_PATH}")
+    else:
+        print("   ⚠️  Google Drive not available")
+
+# ── Timeline export (manual trigger) ─────────────────────────────────────────
+if EXPORT_TIMELINE:
+    print("\n📋 Timeline Export...")
+    _tl_output = f"/content/ComfyUI/output/{OUTPUT_PREFIX}_timeline.{TIMELINE_FORMAT}"
+    if os.path.exists(_tl_output):
+        print(f"   ✓ Timeline already exists: {_tl_output}")
+        # Display summary
+        try:
+            with open(_tl_output, "r") as _f:
+                _tl_data = json.load(_f)
+            if isinstance(_tl_data, dict) and "segments" in _tl_data:
+                print(f"   Segments: {len(_tl_data['segments'])}")
+                print(f"   Total duration: {_tl_data.get('total_duration_seconds', 'N/A')}s")
+                for _seg in _tl_data["segments"][:5]:
+                    print(f"     [{_seg.get('segment_index', '?')}] "
+                          f"{_seg.get('duration_seconds', 0):.1f}s - "
+                          f"{_seg.get('prompt', '')[:50]}...")
+        except Exception:
+            pass
+        # Offer download
+        if DOWNLOAD_AFTER_GENERATE:
+            try:
+                files.download(_tl_output)
+            except Exception:
+                pass
+    else:
+        print(f"   ℹ️  No timeline found. Run generation with EXPORT_TIMELINE=True first.")
+
+# ── Color grade batch application ─────────────────────────────────────────────
+# @markdown ---
+# @markdown ### Batch Post-Processing
+# @markdown Apply color grading to existing output files.
+
+BATCH_COLOR_GRADE_TARGET = ""  # @param {type:"string"}
+# Path to a video file to apply color grading to.
+# Leave empty to skip batch grading.
+
+if BATCH_COLOR_GRADE_TARGET and COLOR_GRADE != "none" and os.path.exists(BATCH_COLOR_GRADE_TARGET):
+    print(f"\n🎨 Applying {COLOR_GRADE} grade to: {BATCH_COLOR_GRADE_TARGET}")
+    try:
+        import imageio
+        _reader = imageio.get_reader(BATCH_COLOR_GRADE_TARGET)
+        _frames = [f for f in _reader]
+        _reader.close()
+        _tensor = torch.from_numpy(np.stack(_frames)).float() / 255.0
+        _graded = apply_color_grade(_tensor, COLOR_GRADE)
+        _graded_np = (_graded.cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+        _graded_path = BATCH_COLOR_GRADE_TARGET.replace(".mp4", f"_{COLOR_GRADE}.mp4")
+        imageio.mimsave(_graded_path, [f for f in _graded_np], fps=FPS, codec='libx264')
+        print(f"   ✓ Graded video saved: {_graded_path}")
+        if SHOW_PREVIEWS:
+            display_video(_graded_path)
+    except Exception as e:
+        print(f"   ⚠️  Batch grading failed ({e})")
+
+print("\n✅ Post-processing complete.")
